@@ -1,0 +1,33 @@
+name: Check meeting page
+
+on:
+  schedule:
+    - cron: "*/1 * * * *"   # elke minuut
+  workflow_dispatch: {}      # ook handmatig kunnen starten
+
+jobs:
+  run-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run checker
+        env:
+          LOGIN_URL: ${{ secrets.LOGIN_URL }}
+          TARGET_URL: ${{ secrets.TARGET_URL }}
+          SITE_USERNAME: ${{ secrets.SITE_USERNAME }}
+          SITE_PASSWORD: ${{ secrets.SITE_PASSWORD }}
+          USERNAME_FIELD: ${{ secrets.USERNAME_FIELD }}
+          PASSWORD_FIELD: ${{ secrets.PASSWORD_FIELD }}
+          EXTRA_FIELDS_JSON: ${{ secrets.EXTRA_FIELDS_JSON }}
+          TEXT_TO_FIND: ${{ secrets.TEXT_TO_FIND }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JITTER_SECONDS_MAX: "10"
+        run: python checker.py
