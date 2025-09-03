@@ -2,8 +2,11 @@ name: Check meeting page
 
 on:
   schedule:
-    - cron: "*/1 * * * *"   # elke minuut
-  workflow_dispatch: {}      # ook handmatig kunnen starten
+    - cron: "*/2 * * * *"   # elke 2 minuten (pas aan naar wens)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # nodig om state.json te kunnen committen
 
 jobs:
   run-check:
@@ -11,13 +14,19 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install deps
         run: pip install -r requirements.txt
+
       - name: Run checker
+        id: runcheck
         env:
           LOGIN_URL: ${{ secrets.LOGIN_URL }}
           TARGET_URL: ${{ secrets.TARGET_URL }}
@@ -30,4 +39,21 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           JITTER_SECONDS_MAX: "10"
-        run: python checker.py
+        run: |
+          set -e
+          python checker.py | tee run.log
+          # exporteer of er state veranderde
+          if grep -q "STATE_CHANGED=1" run.log; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit state if changed
+        if: steps.runcheck.outputs.changed == 'true'
+        run: |
+          git config user.email "actions@users.noreply.github.com"
+          git config user.name "github-actions"
+          git add state.json
+          git commit -m "Update state [skip ci]" || echo "Nothing to commit"
+          git push
