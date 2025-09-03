@@ -1,8 +1,12 @@
 name: Daily summary
 
 on:
+  # 18:00 NL-tijd met zomer-/wintertijd:
+  # - 16:00 UTC (zomertijd, UTC+2)
+  # - 17:00 UTC (wintertijd, UTC+1)
   schedule:
-    - cron: "0 6 * * *"   # 06:00 UTC → 08:00 NL in zomertijd (07:00 in wintertijd)
+    - cron: "0 16 * * *"
+    - cron: "0 17 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -22,9 +26,11 @@ jobs:
         run: pip install requests
       - name: Send daily summary
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN || github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          WORKFLOW_FILE: "check.yml"   # pad/naam van je checker workflow
+          WORKFLOW_FILE: "check.yml"                 # pas aan als je checker-workflow anders heet
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LOCAL_TZ: "Europe/Amsterdam"
+          LOCAL_HOUR: "18"
         run: python daily_summary.py
