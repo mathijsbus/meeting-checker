@@ -18,19 +18,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install deps
         run: pip install requests
+
       - name: Send daily summary
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          WORKFLOW_FILE: "check.yml"                 # pas aan als je checker-workflow anders heet
+          WORKFLOW_FILES: "check_daemon.yml"      # tel checks uit daemon-logs
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           LOCAL_TZ: "Europe/Amsterdam"
           LOCAL_HOUR: "18"
+          # Optioneel: eigen marker als je die in de daemon-logs wijzigt
+          # CHECK_REGEX: "^::group::check "
         run: python daily_summary.py
