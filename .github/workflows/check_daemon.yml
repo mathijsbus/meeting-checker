@@ -82,4 +82,91 @@ jobs:
             local max="${MAX_SLEEP_SEC:-300}"
             local dur
             if [ "$max" -le "$min" ]; then
-              dur="
+              dur="$min"
+            else
+              local range=$((max - min + 1))
+              local offset=$(( RANDOM % range ))
+              dur=$(( min + offset ))
+            fi
+            echo "🕒 Sleeping ${dur}s before next check..."
+            sleep "$dur"
+          }
+
+          sleep_until_quiet_end () {
+            NOW_NUM=$(TZ=$QUIET_TZ date +%H%M)
+            END_NUM=$(echo "$QUIET_END" | tr -d :)
+            if [ "$NOW_NUM" -lt "$END_NUM" ]; then
+              day="today"
+            else
+              day="tomorrow"
+            fi
+            end_ts=$(TZ=$QUIET_TZ date -d "$day $QUIET_END" +%s)
+            now_ts=$(date +%s)
+            sleep_for=$(( end_ts - now_ts ))
+            if [ $sleep_for -gt 0 ]; then
+              echo "⏸  Quiet hours ($QUIET_START–$QUIET_END $QUIET_TZ). Sleeping $sleep_for s until $day $QUIET_END $QUIET_TZ…"
+              sleep $sleep_for
+            fi
+          }
+
+          is_in_quiet () {
+            NOW=$(TZ=$QUIET_TZ date +%H%M)
+            START=$(echo "$QUIET_START" | tr -d :)
+            ENDHM=$(echo "$QUIET_END" | tr -d :)
+            if [ "$START" -le "$ENDHM" ]; then
+              [ "$NOW" -ge "$START" ] && [ "$NOW" -lt "$ENDHM" ]
+            else
+              [ "$NOW" -ge "$START" ] || [ "$NOW" -lt "$ENDHM" ]
+            fi
+          }
+
+          while [ $(date +%s) -lt $END ]; do
+            if is_in_quiet; then
+              sleep_until_quiet_end
+              continue
+            fi
+
+            echo "::group::check $(date -u +%F'T'%T'Z')"
+            python checker.py | tee run.log || true
+
+            # commit alleen bij status-wijziging
+            if grep -q "STATE_CHANGED=1" run.log; then
+              git pull --rebase || true
+              git add state.json
+              git commit -m "Update state [skip ci]" || true
+              git push || true
+            fi
+            echo "::endgroup::"
+
+            # === TEST-modus: stuur heartbeat bij géén verandering ===
+            if [ "$TEST_MODE" = "1" ] || [ "$TEST_MODE" = "true" ] || [ "$TEST_MODE" = "yes" ]; then
+              if ! grep -q "STATE_CHANGED=1" run.log; then
+                STATUS_LINE=$(grep -E '^Status:' run.log | tail -n1 || true)
+                STATUS_TEXT="${STATUS_LINE#Status: }"
+                MSG="🔧 [TEST] Geen verandering (${STATUS_TEXT:-onbekend}) @ $(date -u +%F' '%T) UTC"
+                curl -sS -X POST \
+                  -d "chat_id=${TELEGRAM_CHAT_ID}" \
+                  -d "text=${MSG}" \
+                  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" >/dev/null || true
+              fi
+            fi
+
+            random_sleep
+          done
+
+      - name: Self-dispatch next daemon run (preserve TEST-mode)
+        if: always()
+        env:
+          GH_OWNER_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TEST_MODE: ${{ github.event.inputs.test_mode }}
+          VARS_TEST_MODE:  ${{ vars.TEST_MODE }}
+        run: |
+          TEST_MODE="${INPUT_TEST_MODE:-${VARS_TEST_MODE:-0}}"
+          PAYLOAD=$(printf '{"ref":"%s","inputs":{"test_mode":"%s"}}' "$REF_NAME" "$TEST_MODE")
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${GH_OWNER_REPO}/actions/workflows/check_daemon.yml/dispatches" || true
