@@ -22,17 +22,14 @@ CSS_SELECTOR    = (os.getenv("CSS_SELECTOR") or "").strip()
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHATID = os.getenv("TELEGRAM_CHAT_ID")
-USER_AGENT      = os.getenv(
-    "USER_AGENT",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-)
+USER_AGENT      = os.getenv("USER_AGENT","Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 JITTER_MAX      = int(os.getenv("JITTER_SECONDS_MAX", "5"))
 STATE_FILE      = "state.json"
 DEBUG_SNAPSHOT  = os.getenv("DEBUG_SNAPSHOT", "0") == "1"
 USE_PLAYWRIGHT  = os.getenv("USE_PLAYWRIGHT", "0") == "1"
 
-# optionele overrides via Variables (krijgen voorrang)
+# optionele overrides via Variables
 LOGIN_USERNAME_SELECTOR = os.getenv("LOGIN_USERNAME_SELECTOR")  # bv input[name="email"]
 LOGIN_PASSWORD_SELECTOR = os.getenv("LOGIN_PASSWORD_SELECTOR")  # bv input[name="password"]
 LOGIN_SUBMIT_SELECTOR   = os.getenv("LOGIN_SUBMIT_SELECTOR")    # bv button[type="submit"]
@@ -48,12 +45,10 @@ def _json_env(name, default):
 
 EXTRA_FIELDS = _json_env("EXTRA_FIELDS_JSON", {})
 
-# lichte beleefdheidspauze
 if JITTER_MAX > 0:
     import random
     time.sleep(random.randint(0, JITTER_MAX))
 
-# ===== helpers =====
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     r = requests.post(url, data={"chat_id": TELEGRAM_CHATID, "text": text}, timeout=20)
@@ -101,7 +96,7 @@ def save_snapshot_files(html: str, png_exists: bool):
     except Exception as e:
         print(f"Snapshot failed: {e}", file=sys.stderr)
 
-# ========== requests-fallback ==========
+# -------- requests fallback --------
 def fetch_via_requests():
     def safe_get(sess, url):
         r = sess.get(url, timeout=25, allow_redirects=True); r.raise_for_status(); return r
@@ -123,14 +118,14 @@ def fetch_via_requests():
                 raise
         return r.text, r.url
 
-# ========== Playwright helpers (visible-only) ==========
+# -------- Playwright helpers --------
 def handle_consents(page):
-    cands = [
+    candidates = [
         'button:has-text("Akkoord")','button:has-text("Accepteren")','button:has-text("Alles accepteren")',
         '#onetrust-accept-btn-handler','button#onetrust-accept-btn-handler',
         'button[aria-label*="accept" i]','text=Akkoord','text=Accepteren'
     ]
-    for sel in cands:
+    for sel in candidates:
         try:
             loc = page.locator(sel)
             if loc.count() and loc.first.is_visible():
@@ -166,17 +161,23 @@ def fill_visible(page, selectors, value, label):
                 print(f"Filled visible {label}: {sel} (len={len(iv) if iv else 0})")
             except Exception:
                 print(f"Filled visible {label}: {sel}")
-            return sel
-    return None
+            return sel, el
+    return None, None
 
 def click_visible(page, selectors, label):
     for sel in selectors:
         el = first_visible(page, sel)
         if el:
-            el.click(timeout=3000)
-            print(f"Clicked visible {label}: {sel}")
-            return sel
-    return None
+            try:
+                if hasattr(el, "is_enabled") and not el.is_enabled():
+                    print(f"{label} element found but DISABLED: {sel}")
+                el.click(timeout=3000)
+                print(f"Clicked visible {label}: {sel}")
+                return sel, el
+            except Exception as e:
+                print(f"Click failed on {label} {sel}: {e}")
+                continue
+    return None, None
 
 def collect_login_errors(page):
     texts = []
@@ -196,7 +197,46 @@ def collect_login_errors(page):
             pass
     return texts
 
-# ========== Playwright flow: target -> (maybe) login -> back to target (1 poging) ==========
+def submit_even_if_disabled(page, password_el):
+    """Probeer Enter/blur en eventual JS form.submit() als knop disabled blijft."""
+    try:
+        # blur/validatie
+        password_el.blur()
+        page.keyboard.press("Tab")
+        time.sleep(0.2)
+        page.keyboard.press("Enter")
+        print("Pressed Enter on password/after blur.")
+        time.sleep(0.5)
+    except Exception:
+        pass
+
+    # check submit status en form submit via JS
+    try:
+        submit = first_visible(page, 'button[type="submit"], input[type="submit"]')
+        if submit and hasattr(submit, "is_enabled") and not submit.is_enabled():
+            print("Submit still disabled → trying JS form.submit()")
+            page.evaluate("""
+                () => {
+                  const btn = document.querySelector('button[type="submit"], input[type="submit"]');
+                  const form = btn ? btn.closest('form') : document.querySelector('form');
+                  if (form) form.submit();
+                }
+            """)
+            time.sleep(0.6)
+    except Exception as e:
+        print(f"form.submit() attempt failed: {e}")
+
+def captcha_present(page) -> bool:
+    try:
+        if page.frame_locator('iframe[src*="recaptcha"]').count() > 0:
+            return True
+        if page.locator('div.g-recaptcha').count() > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+# -------- Playwright flow --------
 def fetch_via_playwright():
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
@@ -206,7 +246,6 @@ def fetch_via_playwright():
         context = browser.new_context(user_agent=USER_AGENT)
         page = context.new_page()
 
-        # Log login POST-responses
         login_responses = []
         def on_response(resp):
             try:
@@ -218,18 +257,29 @@ def fetch_via_playwright():
             except Exception: pass
         page.on("response", on_response)
 
-        # 1) ALTIJD eerst naar TARGET
+        # 1) Altijd eerst target
         page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
         handle_consents(page)
 
         def on_login_page() -> bool:
             return ("login" in page.url.lower()) or (page.locator('input[type="password"]').count() > 0)
 
-        # 2) Als login nodig: precies 1 loginpoging → daarna TERUG naar TARGET
+        # 2) Indien nodig: één loginpoging
         if on_login_page():
             print("Login required → open LOGIN_URL once, fill & submit …")
             page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
             handle_consents(page)
+
+            # Captcha detectie?
+            if captcha_present(page):
+                print("CAPTCHA_DETECTED=1 — kan niet automatisch inloggen.")
+                html = page.content()
+                if DEBUG_SNAPSHOT:
+                    try:
+                        page.screenshot(path="after_submit.png", full_page=True)
+                        print("Screenshot saved: after_submit.png")
+                    except Exception: pass
+                return html, page.url, "", False
 
             user_candidates = []
             if LOGIN_USERNAME_SELECTOR: user_candidates.append(LOGIN_USERNAME_SELECTOR)
@@ -253,30 +303,34 @@ def fetch_via_playwright():
                 'text=Inloggen','text=Aanmelden'
             ]
 
-            sel_user = fill_visible(page, user_candidates, USERNAME, "username")
-            sel_pass = fill_visible(page, pass_candidates, PASSWORD, "password")
+            sel_user, _ = fill_visible(page, user_candidates, USERNAME, "username")
+            sel_pass, pass_el = fill_visible(page, pass_candidates, PASSWORD, "password")
             if not sel_user or not sel_pass:
                 raise RuntimeError("Could not find visible username/password fields.")
 
-            clicked = click_visible(page, submit_candidates, "submit")
-            if not clicked:
-                page.keyboard.press("Enter"); print("Pressed Enter to submit.")
+            sub_sel, sub_el = click_visible(page, submit_candidates, "submit")
+            if not sub_sel or (sub_el and hasattr(sub_el, "is_enabled") and not sub_el.is_enabled()):
+                print("Submit click not possible or disabled — trying Enter/JS.")
+                if pass_el:
+                    submit_even_if_disabled(page, pass_el)
+                else:
+                    page.keyboard.press("Enter"); print("Pressed Enter (no pass_el).")
 
-            # wacht kort, screenshot na submit
             try: page.wait_for_load_state("networkidle", timeout=15000)
             except PWTimeout: pass
+
             if DEBUG_SNAPSHOT:
                 try:
                     page.screenshot(path="after_submit.png", full_page=True)
                     print("Screenshot saved: after_submit.png")
                 except Exception: pass
 
-            # TERUG naar TARGET (één keer)
+            # 3) Terug naar target (exact één keer)
             handle_consents(page)
             page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
             handle_consents(page)
 
-        # 3) Nu staan we óf op TARGET, óf nog steeds op LOGIN (login faalde)
+        # 4) Content ophalen
         sel_text = ""
         if CSS_SELECTOR:
             try:
@@ -291,7 +345,7 @@ def fetch_via_playwright():
         html = page.content()
         final_url = page.url
 
-        # debug: cookie-namen
+        # cookie-namen loggen
         try:
             names = [c.get("name","") for c in context.cookies()]
             if names: print("COOKIE_NAMES_SET:", ", ".join(names[:20]))
@@ -306,22 +360,22 @@ def fetch_via_playwright():
             except Exception as e:
                 print(f"Screenshot failed: {e}", file=sys.stderr)
 
-        # Als we nog op /login zijn → duidelijk loggen en GEEN herhaalpogingen
+        # Als we nog op login zitten → log errors en responses
         if "login" in (final_url or "").lower():
-            errs = []
-            try: errs = collect_login_errors(page)
-            except Exception: pass
+            errs = collect_login_errors(page)
             if errs:
                 print("LOGIN_ERRORS_DETECTED:")
                 for e in errs: print(f"- {e}")
             if login_responses:
                 print("LOGIN_HTTP_RESPONSES:")
-                for st, u, b in login_responses[-3:]:
+                for st,u,b in login_responses[-3:]:
                     print(f"- {st} {u}\n  BODY_SNIPPET: {(b or '').strip()[:300]}")
             print("Login failed once; not retrying to avoid loops.")
+
+        browser.close()
         return html, final_url, sel_text, png_written
 
-# ========== extraction & state ==========
+# -------- extraction & state --------
 def extract_relevant_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     return soup.get_text(separator=" ", strip=True)
@@ -337,7 +391,6 @@ def save_state(st):
     with open(STATE_FILE,"w",encoding="utf-8") as f:
         json.dump(st, f, ensure_ascii=False, indent=2)
 
-# ========== main ==========
 def main():
     for req in ("LOGIN_URL","TARGET_URL","SITE_USERNAME","SITE_PASSWORD","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"):
         if not os.getenv(req):
