@@ -1,170 +1,166 @@
-import os
-import sys
-import time
-import json
-import re
+import os, sys, time, json, re
 from html import unescape
 from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 
-# ===================== Config uit env / Secrets =====================
-
-LOGIN_URL       = os.getenv("LOGIN_URL")        # bv. https://site.tld/login
-TARGET_URL      = os.getenv("TARGET_URL")       # bv. https://site.tld/afspraak
+# ====== ENV / Config ======
+LOGIN_URL       = os.getenv("LOGIN_URL")
+TARGET_URL      = os.getenv("TARGET_URL")
 USERNAME        = os.getenv("SITE_USERNAME")
 PASSWORD        = os.getenv("SITE_PASSWORD")
-USERNAME_FIELD  = os.getenv("USERNAME_FIELD", "username")     # pas aan indien anders
-PASSWORD_FIELD  = os.getenv("PASSWORD_FIELD", "password")     # pas aan indien anders
+USERNAME_FIELD  = os.getenv("USERNAME_FIELD", "username")
+PASSWORD_FIELD  = os.getenv("PASSWORD_FIELD", "password")
 
 TEXT_TO_FIND    = os.getenv("TEXT_TO_FIND", "Geen dagen gevonden.")
-CONFIRM_TEXT    = (os.getenv("CONFIRM_TEXT") or "").strip()   # optioneel: vaste tekst die altijd op de slots-pagina staat
+CONFIRM_TEXT    = (os.getenv("CONFIRM_TEXT") or "").strip()
 
-# *** NIEUW: richt preciezer ***
-EXPECTED_HOST   = (os.getenv("EXPECTED_HOST") or "").strip()  # bv. 'mijnsite.nl'  (optioneel maar sterk aangeraden)
-EXPECTED_PATH   = (os.getenv("EXPECTED_PATH") or "").strip()  # bv. '/afspraak'    (optioneel substring match)
-CSS_SELECTOR    = (os.getenv("CSS_SELECTOR") or "").strip()   # bv. '#slots-message' of '.calendar-status' (aanrader)
+EXPECTED_HOST   = (os.getenv("EXPECTED_HOST") or "").strip()
+EXPECTED_PATH   = (os.getenv("EXPECTED_PATH") or "").strip()
+CSS_SELECTOR    = (os.getenv("CSS_SELECTOR") or "").strip()
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHATID = os.getenv("TELEGRAM_CHAT_ID")
+USER_AGENT      = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
-USER_AGENT      = os.getenv(
-    "USER_AGENT",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-)
-JITTER_MAX      = int(os.getenv("JITTER_SECONDS_MAX", "5"))  # kleine willekeurige pauze
-STATE_FILE      = "state.json"  # de-dupe (alleen push bij status-wijziging)
+JITTER_MAX      = int(os.getenv("JITTER_SECONDS_MAX", "5"))
+STATE_FILE      = "state.json"
+DEBUG_SNAPSHOT  = os.getenv("DEBUG_SNAPSHOT", "0") == "1"
+USE_PLAYWRIGHT  = os.getenv("USE_PLAYWRIGHT", "0") == "1"
 
-# Debug/snapshot (artifact)
-DEBUG_SNAPSHOT  = os.getenv("DEBUG_SNAPSHOT", "0") == "1"     # als 1: sla last_response.html op voor inspectie
+# optionele selectors voor Playwright login
+LOGIN_USERNAME_SELECTOR = os.getenv("LOGIN_USERNAME_SELECTOR")  # bv input[name="username"]
+LOGIN_PASSWORD_SELECTOR = os.getenv("LOGIN_PASSWORD_SELECTOR")  # bv input[name="password"]
+LOGIN_SUBMIT_SELECTOR   = os.getenv("LOGIN_SUBMIT_SELECTOR")    # bv button[type="submit"]
 
-# ===== Tolerant inlezen van EXTRA_FIELDS_JSON (mag leeg zijn) =====
-def _json_env(name: str, default):
+def _json_env(name, default):
     raw = os.getenv(name)
     if not raw or not raw.strip():
         return default
     try:
         return json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"Warning: invalid JSON in {name}: {e}; using default.", file=sys.stderr)
+    except json.JSONDecodeError:
         return default
 
-EXTRA_FIELDS = _json_env("EXTRA_FIELDS_JSON", {})  # bv. {"keep_logged_in":"1"} of site-specifieke CSRF-naam
+EXTRA_FIELDS = _json_env("EXTRA_FIELDS_JSON", {})  # voor requests-flow
 
-# ===================== Kleine beleefdheids-pauze =====================
+# kleine beleefdheids-pauze
 if JITTER_MAX > 0:
     import random
     time.sleep(random.randint(0, JITTER_MAX))
 
-# ===================== Heuristieken & helpers =====================
-
-LOGIN_HINTS = (
-    "wachtwoord", "password", "inloggen", "aanmelden", "login", 'type="password"'
-)
-
+# ====== helpers ======
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHATID, "text": text}
-    r = requests.post(url, data=data, timeout=15)
+    r = requests.post(url, data={"chat_id": TELEGRAM_CHATID, "text": text}, timeout=20)
     r.raise_for_status()
 
 def looks_like_login_page(html: str) -> bool:
-    lowered = html.lower()
-    if any(hint in lowered for hint in LOGIN_HINTS):
-        return True
-    # simpele heuristiek: formulier met username/email veld
-    if re.search(r'<form[^>]*>', lowered) and re.search(r'name=["\']?(?:username|email)["\']?', lowered):
-        return True
-    return False
+    lower = html.lower()
+    return any(w in lower for w in ("wachtwoord", "password", "inloggen", "aanmelden", "login", 'type="password"'))
+
+def url_checks(final_url: str) -> bool:
+    ok = True
+    if EXPECTED_HOST:
+        host = (urlparse(final_url).hostname or "").lower()
+        if host != EXPECTED_HOST.lower():
+            print(f"URL check failed host: '{host}' != '{EXPECTED_HOST}'", file=sys.stderr); ok = False
+    if ok and EXPECTED_PATH:
+        path = urlparse(final_url).path or ""
+        if EXPECTED_PATH not in path:
+            print(f"URL check failed path: '{path}' mist '{EXPECTED_PATH}'", file=sys.stderr); ok = False
+    return ok
+
+def normalize(s: str) -> str:
+    # casefold + collapse whitespace + strip punctuation at ends
+    return re.sub(r"\s+", " ", (s or "")).strip().casefold()
 
 def find_csrf(html: str):
-    patterns = [
+    pats = [
         r'name=["\']csrf_token["\']\s+value=["\']([^"\']+)["\']',
         r'name=["\']_token["\']\s+value=["\']([^"\']+)["\']',
         r'name=["\']__requestverificationtoken["\']\s+value=["\']([^"\']+)["\']',
         r'name=["\']csrfmiddlewaretoken["\']\s+value=["\']([^"\']+)["\']',
     ]
-    lowered = html.lower()
-    for pat in patterns:
-        m = re.search(pat, lowered, re.I)
-        if m:
-            return m.group(1)
+    lower = html.lower()
+    for p in pats:
+        m = re.search(p, lower, re.I)
+        if m: return m.group(1)
     return None
 
-def safe_get(session: requests.Session, url: str) -> requests.Response:
-    r = session.get(url, timeout=25, allow_redirects=True)
-    r.raise_for_status()
-    return r
+# ---------- requests (non-JS) fallback ----------
+def fetch_via_requests():
+    def safe_get(sess, url):
+        r = sess.get(url, timeout=25, allow_redirects=True); r.raise_for_status(); return r
+    with requests.Session() as s:
+        s.headers.update({"User-Agent": USER_AGENT})
+        try:
+            r = safe_get(s, TARGET_URL)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code in (401,403):
+                r = s.get(LOGIN_URL, timeout=25); r.raise_for_status()
+                token = find_csrf(r.text)
+                fields = dict(EXTRA_FIELDS)
+                if token and not any(k in fields for k in ("csrf_token","_token","__requestverificationtoken","csrfmiddlewaretoken")):
+                    fields["csrf_token"] = token
+                payload = {USERNAME_FIELD: USERNAME, PASSWORD_FIELD: PASSWORD, **fields}
+                r = s.post(LOGIN_URL, data=payload, timeout=25); r.raise_for_status()
+                r = safe_get(s, TARGET_URL)
+            else:
+                raise
+        # als nog login-achtig → geen goede content (JS-app)
+        return r.text, r.url
 
-def is_redirect_to_login(resp: requests.Response) -> bool:
-    final_url = resp.url.lower()
-    if "login" in final_url:
-        return True
-    return looks_like_login_page(resp.text)
+# ---------- Playwright (JS-rendered) ----------
+def fetch_via_playwright():
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(user_agent=USER_AGENT)
+        page = context.new_page()
+        # probeer direct target
+        page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
+        if "login" in page.url.lower() or page.locator('input[type="password"]').count() > 0:
+            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+            if LOGIN_USERNAME_SELECTOR and LOGIN_PASSWORD_SELECTOR:
+                page.fill(LOGIN_USERNAME_SELECTOR, USERNAME)
+                page.fill(LOGIN_PASSWORD_SELECTOR, PASSWORD)
+                if LOGIN_SUBMIT_SELECTOR:
+                    page.click(LOGIN_SUBMIT_SELECTOR)
+                else:
+                    page.keyboard.press("Enter")
+            else:
+                # probeer via name= velden
+                page.fill(f'input[name="{USERNAME_FIELD}"]', USERNAME)
+                page.fill(f'input[name="{PASSWORD_FIELD}"]', PASSWORD)
+                page.keyboard.press("Enter")
+            page.wait_for_load_state("networkidle", timeout=60000)
+            page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
 
-def do_login(session: requests.Session):
-    # 1) GET loginpagina (haal evt. CSRF)
-    r = session.get(LOGIN_URL, timeout=25, allow_redirects=True)
-    r.raise_for_status()
-    html = r.text
+        # indien selector meegegeven: wacht er even op
+        sel_text = ""
+        if CSS_SELECTOR:
+            try:
+                page.wait_for_selector(CSS_SELECTOR, timeout=10000)
+                sel_text = page.text_content(CSS_SELECTOR) or ""
+            except PWTimeout:
+                sel_text = ""
 
-    fields = dict(EXTRA_FIELDS)  # kopie
-    token = find_csrf(html)
-    if token and not any(k in fields for k in ("csrf_token", "_token", "__requestverificationtoken", "csrfmiddlewaretoken")):
-        fields["csrf_token"] = token
+        html = page.content()
+        final_url = page.url
 
-    payload = {USERNAME_FIELD: USERNAME, PASSWORD_FIELD: PASSWORD, **fields}
+        if DEBUG_SNAPSHOT:
+            with open("last_response.html", "w", encoding="utf-8") as f:
+                f.write(html)
+            try:
+                page.screenshot(path="last_response.png", full_page=True)
+            except Exception:
+                pass
 
-    # 2) POST login
-    r = session.post(LOGIN_URL, data=payload, timeout=25, allow_redirects=True)
-    r.raise_for_status()
-    return r
-
-def fetch_target(session: requests.Session):
-    """Probeer target te halen; doe login als nodig. Return (html, final_url, login_attempted)."""
-    login_attempted = False
-    try:
-        r = safe_get(session, TARGET_URL)
-    except requests.HTTPError as e:
-        if e.response is not None and e.response.status_code in (401, 403):
-            do_login(session)
-            login_attempted = True
-            r = safe_get(session, TARGET_URL)
-        else:
-            raise
-
-    if is_redirect_to_login(r):
-        do_login(session)
-        login_attempted = True
-        r = safe_get(session, TARGET_URL)
-
-    return r.text, r.url, login_attempted
-
-def url_checks(final_url: str) -> bool:
-    """Controleer dat we op het juiste domein/pad zitten (als EXPECTED_* gezet is)."""
-    ok = True
-    if EXPECTED_HOST:
-        host = urlparse(final_url).hostname or ""
-        if host.lower() != EXPECTED_HOST.lower():
-            print(f"URL check failed: host '{host}' != EXPECTED_HOST '{EXPECTED_HOST}'", file=sys.stderr)
-            ok = False
-    if ok and EXPECTED_PATH:
-        path = urlparse(final_url).path or ""
-        if EXPECTED_PATH not in path:
-            print(f"URL check failed: path '{path}' mist EXPECTED_PATH '{EXPECTED_PATH}'", file=sys.stderr)
-            ok = False
-    return ok
+        browser.close()
+        return html, final_url, sel_text
 
 def extract_relevant_text(html: str) -> str:
-    """Pak ofwel de hele tekst, of (liever) de tekst uit een specifiek element."""
-    if CSS_SELECTOR:
-        soup = BeautifulSoup(html, "html.parser")
-        node = soup.select_one(CSS_SELECTOR)
-        if not node:
-            print(f"CSS selector '{CSS_SELECTOR}' niet gevonden; val terug op hele document.", file=sys.stderr)
-            return soup.get_text(separator=" ", strip=True)
-        return node.get_text(separator=" ", strip=True)
-    # fallback: hele documenttekst
     soup = BeautifulSoup(html, "html.parser")
     return soup.get_text(separator=" ", strip=True)
 
@@ -175,86 +171,63 @@ def load_state():
     except Exception:
         return {"available": None}
 
-def save_state(new_state):
+def save_state(st):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(new_state, f, ensure_ascii=False, indent=2)
+        json.dump(st, f, ensure_ascii=False, indent=2)
 
-# ===================== Main =====================
-
+# ===================== main =====================
 def main():
-    # check verplichte envs
-    required = [
-        "LOGIN_URL", "TARGET_URL", "SITE_USERNAME", "SITE_PASSWORD",
-        "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"
-    ]
-    missing = [n for n in required if not os.getenv(n)]
-    if missing:
-        print("Missing required env: " + ", ".join(missing), file=sys.stderr)
-        return 2
+    for req in ("LOGIN_URL","TARGET_URL","SITE_USERNAME","SITE_PASSWORD","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"):
+        if not os.getenv(req):
+            print(f"Missing env: {req}", file=sys.stderr); return 2
 
-    with requests.Session() as s:
-        s.headers.update({"User-Agent": USER_AGENT})
-        html, final_url, login_attempted = fetch_target(s)
+    # haal pagina
+    selected_text = ""
+    if USE_PLAYWRIGHT:
+        html, final_url, selected_text = fetch_via_playwright()
+    else:
+        html, final_url = fetch_via_requests()
+    full_text = unescape(html)
 
-    # Snapshot voor inspectie (optioneel)
-    if DEBUG_SNAPSHOT:
-        try:
-            with open("last_response.html", "w", encoding="utf-8") as f:
-                f.write(html)
-            print("SNAPSHOT_SAVED=1")
-        except Exception as e:
-            print(f"Snapshot failed: {e}", file=sys.stderr)
-
-    text_full = unescape(html)
-
-    # 0) Niet op loginpagina blijven hangen
-    if looks_like_login_page(text_full):
-        print("Op loginpagina terechtgekomen; geen alert. (Controleer USERNAME_FIELD/PASSWORD_FIELD/EXTRA_FIELDS_JSON.)")
+    # login-achtige content? dan stoppen
+    if looks_like_login_page(full_text):
+        print("Op loginpagina / niet-ingeladen content; geen alert.")
         print(f"Final URL: {final_url}")
         return 0
 
-    # 1) URL-check (indien ingesteld)
+    # URL + pagina-confirmaties
     if not url_checks(final_url):
         print(f"Final URL (mismatch): {final_url}")
         return 0
-
-    # 2) Pagina-check: CONFIRM_TEXT (indien ingesteld)
-    lowered = text_full.lower()
-    if CONFIRM_TEXT and (CONFIRM_TEXT.lower() not in lowered):
+    if CONFIRM_TEXT and normalize(CONFIRM_TEXT) not in normalize(full_text):
         print(f"CONFIRM_TEXT '{CONFIRM_TEXT}' niet gevonden; geen alert.")
         print(f"Final URL: {final_url}")
         return 0
 
-    # 3) Element-check: kijk gericht in CSS_SELECTOR of het hele document
-    relevant_text = extract_relevant_text(text_full)
+    # bepaal “relevant text”
+    if CSS_SELECTOR and selected_text:
+        relevant = selected_text
+    else:
+        relevant = extract_relevant_text(full_text)
 
-    # Beschikbaarheid: als de “geen dagen” tekst NIET voorkomt in het relevante stuk, dan lijkt het beschikbaar
-    available = (TEXT_TO_FIND not in relevant_text)
+    # availability met normalisatie (spaties/case negeren)
+    available = normalize(TEXT_TO_FIND) not in normalize(relevant)
 
-    # De-dupe op basis van state.json
+    # de-dupe
     state = load_state()
     prev = state.get("available")
-
     if available and prev is not True:
         send_telegram("🎉 Er lijken data beschikbaar! Check de site nu.")
         print("Notificatie verstuurd.")
-
     if (prev is None) or (available != prev):
         save_state({"available": available})
         print("STATE_CHANGED=1")
 
-    # Logging ter controle
     print(f"Status: {'BESCHIKBAAR' if available else 'GEEN'}")
     print(f"Final URL: {final_url}")
-    if login_attempted:
-        print("Login attempted: yes")
-    else:
-        print("Login attempted: no")
-
-    # Extra logging: een klein fragment rondom TEXT_TO_FIND of eerste chars van relevant
-    snippet = relevant_text[:300].replace("\n", " ")
-    print(f"Relevant snippet (first 300 chars): {snippet}")
-
+    print("Relevant snippet (first 300 chars):", (relevant or "")[:300].replace("\n"," "))
+    if DEBUG_SNAPSHOT:
+        print("SNAPSHOT_SAVED=1")
     return 0
 
 if __name__ == "__main__":
