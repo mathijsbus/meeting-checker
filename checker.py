@@ -1,6 +1,6 @@
 import os, sys, time, json, re, traceback
 from html import unescape
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import requests
 from bs4 import BeautifulSoup
 
@@ -22,7 +22,10 @@ CSS_SELECTOR    = (os.getenv("CSS_SELECTOR") or "").strip()
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHATID = os.getenv("TELEGRAM_CHAT_ID")
-USER_AGENT      = os.getenv("USER_AGENT","Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+USER_AGENT      = os.getenv(
+    "USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
 
 JITTER_MAX      = int(os.getenv("JITTER_SECONDS_MAX", "5"))
 STATE_FILE      = "state.json"
@@ -43,12 +46,14 @@ def _json_env(name, default):
     except json.JSONDecodeError:
         return default
 
-EXTRA_FIELDS = _json_env("EXTRA_FIELDS_JSON", {})
+EXTRA_FIELDS = _json_env("EXTRA_FIELDS_JSON", {})  # alleen gebruikt in requests-fallback
 
+# lichte beleefdheidspauze
 if JITTER_MAX > 0:
     import random
     time.sleep(random.randint(0, JITTER_MAX))
 
+# ===== helpers =====
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     r = requests.post(url, data={"chat_id": TELEGRAM_CHATID, "text": text}, timeout=20)
@@ -80,9 +85,8 @@ def find_csrf(html: str):
         r'name=["\']__requestverificationtoken["\']\s+value=["\']([^"\']+)["\']',
         r'name=["\']csrfmiddlewaretoken["\']\s+value=["\']([^"\']+)["\']',
     ]
-    lower = html.lower()
     for p in pats:
-        m = re.search(p, lower, re.I)
+        m = re.search(p, html, re.I)
         if m: return m.group(1)
     return None
 
@@ -96,7 +100,7 @@ def save_snapshot_files(html: str, png_exists: bool):
     except Exception as e:
         print(f"Snapshot failed: {e}", file=sys.stderr)
 
-# -------- requests fallback --------
+# -------- requests fallback (simple GET→maybe login) --------
 def fetch_via_requests():
     def safe_get(sess, url):
         r = sess.get(url, timeout=25, allow_redirects=True); r.raise_for_status(); return r
@@ -107,7 +111,7 @@ def fetch_via_requests():
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code in (401,403):
                 r = s.get(LOGIN_URL, timeout=25); r.raise_for_status()
-                token = find_csrf(r.text)
+                token = find_csrf(r.text or "")
                 fields = dict(EXTRA_FIELDS)
                 if token and not any(k in fields for k in ("csrf_token","_token","__requestverificationtoken","csrfmiddlewaretoken")):
                     fields["csrf_token"] = token
@@ -118,14 +122,14 @@ def fetch_via_requests():
                 raise
         return r.text, r.url
 
-# -------- Playwright helpers --------
+# ---------- Playwright helpers ----------
 def handle_consents(page):
-    candidates = [
+    cands = [
         'button:has-text("Akkoord")','button:has-text("Accepteren")','button:has-text("Alles accepteren")',
         '#onetrust-accept-btn-handler','button#onetrust-accept-btn-handler',
         'button[aria-label*="accept" i]','text=Akkoord','text=Accepteren'
     ]
-    for sel in candidates:
+    for sel in cands:
         try:
             loc = page.locator(sel)
             if loc.count() and loc.first.is_visible():
@@ -147,9 +151,11 @@ def first_visible(page, selector):
     return None
 
 def fill_visible(page, selectors, value, label):
+    el = None; used = None
     for sel in selectors:
         el = first_visible(page, sel)
         if el:
+            used = sel
             try: el.click(timeout=2000)
             except Exception: pass
             try: el.fill("", timeout=2000)
@@ -161,8 +167,8 @@ def fill_visible(page, selectors, value, label):
                 print(f"Filled visible {label}: {sel} (len={len(iv) if iv else 0})")
             except Exception:
                 print(f"Filled visible {label}: {sel}")
-            return sel, el
-    return None, None
+            break
+    return used, el
 
 def click_visible(page, selectors, label):
     for sel in selectors:
@@ -179,28 +185,9 @@ def click_visible(page, selectors, label):
                 continue
     return None, None
 
-def collect_login_errors(page):
-    texts = []
-    cands = [
-        '[role="alert"]','.MuiAlert-root','.alert','.error','.invalid-feedback',
-        '.help-block','.MuiFormHelperText-root','span[role="alert"]',
-        'text=/ongeldig|incorrect|fout|verkeerd|combina/i'
-    ]
-    for sel in cands:
-        try:
-            loc = page.locator(sel)
-            if loc.count():
-                for i in range(min(3, loc.count())):
-                    t = (loc.nth(i).inner_text() or "").strip()
-                    if t: texts.append(f"{sel}: {t}")
-        except Exception:
-            pass
-    return texts
-
 def submit_even_if_disabled(page, password_el):
-    """Probeer Enter/blur en eventual JS form.submit() als knop disabled blijft."""
+    # blur/validatie + Enter
     try:
-        # blur/validatie
         password_el.blur()
         page.keyboard.press("Tab")
         time.sleep(0.2)
@@ -209,34 +196,116 @@ def submit_even_if_disabled(page, password_el):
         time.sleep(0.5)
     except Exception:
         pass
-
-    # check submit status en form submit via JS
+    # JS submit
     try:
-        submit = first_visible(page, 'button[type="submit"], input[type="submit"]')
-        if submit and hasattr(submit, "is_enabled") and not submit.is_enabled():
-            print("Submit still disabled → trying JS form.submit()")
-            page.evaluate("""
-                () => {
-                  const btn = document.querySelector('button[type="submit"], input[type="submit"]');
-                  const form = btn ? btn.closest('form') : document.querySelector('form');
-                  if (form) form.submit();
-                }
-            """)
-            time.sleep(0.6)
+        page.evaluate("""
+            () => {
+              const btn = document.querySelector('button[type="submit"], input[type="submit"]');
+              const form = btn ? btn.closest('form') : document.querySelector('form');
+              if (form && form.requestSubmit) form.requestSubmit();
+              else if (form) form.submit();
+            }
+        """)
+        time.sleep(0.6)
     except Exception as e:
         print(f"form.submit() attempt failed: {e}")
 
 def captcha_present(page) -> bool:
     try:
-        if page.frame_locator('iframe[src*="recaptcha"]').count() > 0:
-            return True
-        if page.locator('div.g-recaptcha').count() > 0:
-            return True
+        if page.frame_locator('iframe[src*="recaptcha"]').count() > 0: return True
+        if page.locator('div.g-recaptcha').count() > 0: return True
     except Exception:
         pass
     return False
 
-# -------- Playwright flow --------
+# ---------- HTTP login fallback (extract <form> + POST, set cookies in Playwright) ----------
+def http_login_and_transfer_cookies(context):
+    try:
+        session = requests.Session()
+        session.headers.update({"User-Agent": USER_AGENT, "Referer": LOGIN_URL})
+        r = session.get(LOGIN_URL, timeout=25)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # kies form met password input
+        forms = soup.find_all("form")
+        login_form = None
+        for f in forms:
+            if f.find("input", {"type": "password"}):
+                login_form = f; break
+        if not login_form:
+            print("HTTP fallback: geen login <form> gevonden.", file=sys.stderr)
+            return False
+
+        action = login_form.get("action") or LOGIN_URL
+        action = urljoin(LOGIN_URL, action)
+        method = (login_form.get("method") or "post").lower()
+
+        payload = {}
+        for inp in login_form.find_all("input"):
+            name = inp.get("name")
+            if not name: continue
+            val = inp.get("value") or ""
+            payload[name] = val
+
+        # map mogelijke username velden
+        user_keys = [k for k in payload.keys() if k.lower() in ("email","username","user","login","login_email")]
+        if not user_keys:
+            # pak 1e text/email input uit form
+            cand = login_form.find("input", {"type": ["email","text"]})
+            if cand and cand.get("name"): user_keys = [cand.get("name")]
+        if not user_keys:
+            user_keys = [USERNAME_FIELD]
+
+        pass_keys = [k for k in payload.keys() if k.lower() in ("password","pass","pwd")]
+        if not pass_keys:
+            pass_keys = [PASSWORD_FIELD]
+
+        payload[user_keys[0]] = USERNAME
+        payload[pass_keys[0]] = PASSWORD
+
+        # CSRF toevoegen als apart veld ontbreekt
+        if not any(k in payload for k in ("csrf_token","_token","__requestverificationtoken","csrfmiddlewaretoken")):
+            token = find_csrf(r.text or "")
+            if token:
+                payload["csrf_token"] = token
+
+        if method == "post":
+            lr = session.post(action, data=payload, timeout=25, allow_redirects=True)
+        else:
+            lr = session.get(action, params=payload, timeout=25, allow_redirects=True)
+
+        print(f"HTTP fallback POST to {action} → status {lr.status_code}")
+        # log klein stukje body
+        try:
+            body_snip = (lr.text or "")[:300]
+            if body_snip:
+                print("HTTP fallback BODY_SNIPPET:", body_snip.replace("\n"," ")[:300])
+        except Exception:
+            pass
+
+        # cookies naar Playwright
+        cookies = []
+        host = urlparse(LOGIN_URL).hostname
+        for c in session.cookies:
+            dom = c.domain if c.domain else host
+            cookies.append({
+                "name": c.name, "value": c.value,
+                "domain": dom, "path": c.path if c.path else "/",
+                "httpOnly": True, "secure": True,
+            })
+        if not cookies:
+            print("HTTP fallback: geen cookies om over te zetten.", file=sys.stderr)
+            return False
+
+        context.add_cookies(cookies)
+        print("HTTP fallback: cookies overgezet naar Playwright context.")
+        return True
+    except Exception as e:
+        print(f"HTTP fallback login error: {e}", file=sys.stderr)
+        return False
+
+# ---------- Playwright flow ----------
 def fetch_via_playwright():
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
@@ -246,6 +315,7 @@ def fetch_via_playwright():
         context = browser.new_context(user_agent=USER_AGENT)
         page = context.new_page()
 
+        # log login POST-responses
         login_responses = []
         def on_response(resp):
             try:
@@ -257,27 +327,25 @@ def fetch_via_playwright():
             except Exception: pass
         page.on("response", on_response)
 
-        # 1) Altijd eerst target
+        # 1) Altijd eerst naar TARGET
         page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
         handle_consents(page)
 
         def on_login_page() -> bool:
             return ("login" in page.url.lower()) or (page.locator('input[type="password"]').count() > 0)
 
-        # 2) Indien nodig: één loginpoging
+        # 2) Indien nodig: één UI-loginpoging
         if on_login_page():
             print("Login required → open LOGIN_URL once, fill & submit …")
             page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
             handle_consents(page)
 
-            # Captcha detectie?
-            if captcha_present(page):
+            # Captcha?
+            if captcha_present(page := page):
                 print("CAPTCHA_DETECTED=1 — kan niet automatisch inloggen.")
                 html = page.content()
                 if DEBUG_SNAPSHOT:
-                    try:
-                        page.screenshot(path="after_submit.png", full_page=True)
-                        print("Screenshot saved: after_submit.png")
+                    try: page.screenshot(path="after_submit.png", full_page=True); print("Screenshot saved: after_submit.png")
                     except Exception: pass
                 return html, page.url, "", False
 
@@ -303,7 +371,7 @@ def fetch_via_playwright():
                 'text=Inloggen','text=Aanmelden'
             ]
 
-            sel_user, _ = fill_visible(page, user_candidates, USERNAME, "username")
+            sel_user, _user_el = fill_visible(page, user_candidates, USERNAME, "username")
             sel_pass, pass_el = fill_visible(page, pass_candidates, PASSWORD, "password")
             if not sel_user or not sel_pass:
                 raise RuntimeError("Could not find visible username/password fields.")
@@ -325,12 +393,22 @@ def fetch_via_playwright():
                     print("Screenshot saved: after_submit.png")
                 except Exception: pass
 
-            # 3) Terug naar target (exact één keer)
+            # 3) Terug naar TARGET
             handle_consents(page)
             page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
             handle_consents(page)
 
-        # 4) Content ophalen
+            # 4) Nog steeds /login? → HTTP fallback
+            if on_login_page():
+                print("UI-login lijkt niet te werken → probeer HTTP fallback …")
+                ok = http_login_and_transfer_cookies(context)
+                if ok:
+                    page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+                    handle_consents(page)
+                else:
+                    print("HTTP fallback mislukte of gaf geen cookies.")
+
+        # 5) Content ophalen / snapshots
         sel_text = ""
         if CSS_SELECTOR:
             try:
@@ -345,7 +423,6 @@ def fetch_via_playwright():
         html = page.content()
         final_url = page.url
 
-        # cookie-namen loggen
         try:
             names = [c.get("name","") for c in context.cookies()]
             if names: print("COOKIE_NAMES_SET:", ", ".join(names[:20]))
@@ -360,19 +437,29 @@ def fetch_via_playwright():
             except Exception as e:
                 print(f"Screenshot failed: {e}", file=sys.stderr)
 
-        # Als we nog op login zitten → log errors en responses
+        # log login responses en errors indien nog op login
         if "login" in (final_url or "").lower():
-            errs = collect_login_errors(page)
-            if errs:
-                print("LOGIN_ERRORS_DETECTED:")
-                for e in errs: print(f"- {e}")
+            # verzamel eventuele foutteksten
+            try:
+                texts = []
+                for sel in ('[role="alert"]','.MuiAlert-root','.alert','.error','.invalid-feedback',
+                            '.help-block','.MuiFormHelperText-root','span[role="alert"]',
+                            'text=/ongeldig|incorrect|fout|verkeerd|combina/i'):
+                    loc = page.locator(sel)
+                    if loc.count():
+                        for i in range(min(3, loc.count())):
+                            t = (loc.nth(i).inner_text() or "").strip()
+                            if t: texts.append(f"{sel}: {t}")
+                if texts:
+                    print("LOGIN_ERRORS_DETECTED:")
+                    for e in texts: print(f"- {e}")
+            except Exception: pass
+
             if login_responses:
                 print("LOGIN_HTTP_RESPONSES:")
                 for st,u,b in login_responses[-3:]:
                     print(f"- {st} {u}\n  BODY_SNIPPET: {(b or '').strip()[:300]}")
-            print("Login failed once; not retrying to avoid loops.")
-
-        browser.close()
+            print("Login failed (UI + fallback); not retrying.")
         return html, final_url, sel_text, png_written
 
 # -------- extraction & state --------
