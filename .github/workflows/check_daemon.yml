@@ -1,13 +1,20 @@
 name: Check meeting page (daemon)
 
 on:
-  workflow_dispatch: {}           # handmatig starten
+  # Handmatig starten met keuze voor testmodus
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "TEST-modus: stuur push bij GEEN verandering (1=aan, 0=uit)"
+        required: false
+        default: "0"
+  # Back-up start (voor het geval self-dispatch faalt)
   schedule:
-    - cron: "0 */6 * * *"         # back-up start elke 6 uur (voor het geval self-dispatch faalt)
+    - cron: "0 */6 * * *"
 
 permissions:
-  contents: write                 # voor state.json commits
-  actions: write                  # om zichzelf opnieuw te starten
+  contents: write   # voor state.json commits
+  actions: write    # om zichzelf opnieuw te starten
 
 concurrency:
   group: meeting-checker-daemon
@@ -16,7 +23,7 @@ concurrency:
 jobs:
   loop:
     runs-on: ubuntu-latest
-    timeout-minutes: 355          # ~5u55 (GitHub-hosted limiet is ~6u)
+    timeout-minutes: 355          # ~5u55 (GitHub-hosted limiet ~6u)
 
     steps:
       - uses: actions/checkout@v4
@@ -31,9 +38,9 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run loop with quiet hours + random interval
+      - name: Run loop (quiet hours + random interval + optional TEST-mode)
         env:
-          # --- jouw checker envs ---
+          # --- checker envs ---
           LOGIN_URL: ${{ secrets.LOGIN_URL }}
           TARGET_URL: ${{ secrets.TARGET_URL }}
           SITE_USERNAME: ${{ secrets.SITE_USERNAME }}
@@ -52,91 +59,27 @@ jobs:
           QUIET_END:   "06:32"
 
           # --- random interval (aanpasbaar) ---
-          MIN_SLEEP_SEC: "60"     # 1 minuut
-          MAX_SLEEP_SEC: "300"    # 5 minuten
+          MIN_SLEEP_SEC: "60"   # 1 min
+          MAX_SLEEP_SEC: "300"  # 5 min
+
+          # --- TEST-modus bron: input of repo variable ---
+          INPUT_TEST_MODE: ${{ github.event.inputs.test_mode }}
+          VARS_TEST_MODE:  ${{ vars.TEST_MODE }}
         run: |
           set -e
-          END=$(( $(date +%s) + 20700 ))   # ~5u45 (5*3600 + 45*60)
+          END=$(( $(date +%s) + 20700 ))   # ~5u45
+
+          # Bepaal effectieve TEST-modus:
+          # 1) workflow_dispatch input, anders 2) repo variable TEST_MODE, anders 0
+          TEST_MODE="${INPUT_TEST_MODE:-${VARS_TEST_MODE:-0}}"
+          echo "TEST_MODE=${TEST_MODE}"
 
           git config user.email "actions@users.noreply.github.com"
           git config user.name "github-actions"
 
-          # hulpfuncties
           random_sleep () {
             local min="${MIN_SLEEP_SEC:-60}"
             local max="${MAX_SLEEP_SEC:-300}"
             local dur
             if [ "$max" -le "$min" ]; then
-              dur="$min"
-            else
-              local range=$((max - min + 1))
-              local offset=$(( RANDOM % range ))
-              dur=$(( min + offset ))
-            fi
-            echo "🕒 Sleeping ${dur}s before next check..."
-            sleep "$dur"
-          }
-
-          sleep_until_quiet_end () {
-            NOW_NUM=$(TZ=$QUIET_TZ date +%H%M)
-            END_NUM=$(echo "$QUIET_END" | tr -d :)
-            if [ "$NOW_NUM" -lt "$END_NUM" ]; then
-              day="today"
-            else
-              day="tomorrow"
-            fi
-            end_ts=$(TZ=$QUIET_TZ date -d "$day $QUIET_END" +%s)
-            now_ts=$(date +%s)
-            sleep_for=$(( end_ts - now_ts ))
-            if [ $sleep_for -gt 0 ]; then
-              echo "⏸  Quiet hours ($QUIET_START–$QUIET_END $QUIET_TZ). Sleeping $sleep_for s until $day $QUIET_END $QUIET_TZ…"
-              sleep $sleep_for
-            fi
-          }
-
-          is_in_quiet () {
-            NOW=$(TZ=$QUIET_TZ date +%H%M)
-            START=$(echo "$QUIET_START" | tr -d :)
-            ENDHM=$(echo "$QUIET_END" | tr -d :)
-            if [ "$START" -le "$ENDHM" ]; then
-              # normaal venster (bijv. 00:00–06:32)
-              [ "$NOW" -ge "$START" ] && [ "$NOW" -lt "$ENDHM" ]
-            else
-              # venster over middernacht (bijv. 22:00–06:32)
-              [ "$NOW" -ge "$START" ] || [ "$NOW" -lt "$ENDHM" ]
-            fi
-          }
-
-          while [ $(date +%s) -lt $END ]; do
-            if is_in_quiet; then
-              sleep_until_quiet_end
-              continue
-            fi
-
-            echo "::group::check $(date -u +%F'T'%T'Z')"
-            python checker.py | tee run.log || true
-
-            # commit alleen bij status-wijziging
-            if grep -q "STATE_CHANGED=1" run.log; then
-              git pull --rebase || true
-              git add state.json
-              git commit -m "Update state [skip ci]" || true
-              git push || true
-            fi
-            echo "::endgroup::"
-
-            random_sleep   # <— random 60–300s
-          done
-
-      - name: Self-dispatch next daemon run
-        if: always()
-        env:
-          GH_OWNER_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ github.token }}
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          curl -sS -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            https://api.github.com/repos/$GH_OWNER_REPO/actions/workflows/check_daemon.yml/dispatches \
-            -d '{"ref":"'"$REF_NAME"'"}' || true
+              dur="
