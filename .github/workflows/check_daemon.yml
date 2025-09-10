@@ -42,7 +42,7 @@ jobs:
 
       - name: Run loop (quiet hours + random interval + TEST-mode + Playwright)
         env:
-          # --- secrets ---
+          # secrets
           LOGIN_URL: ${{ secrets.LOGIN_URL }}
           TARGET_URL: ${{ secrets.TARGET_URL }}
           SITE_USERNAME: ${{ secrets.SITE_USERNAME }}
@@ -54,30 +54,25 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           JITTER_SECONDS_MAX: "10"
-
-          # --- variables ---
+          # variables
           EXPECTED_HOST: ${{ vars.EXPECTED_HOST }}
           EXPECTED_PATH: ${{ vars.EXPECTED_PATH }}
           CONFIRM_TEXT:  ${{ vars.CONFIRM_TEXT }}
           CSS_SELECTOR:  ${{ vars.CSS_SELECTOR }}
           DEBUG_SNAPSHOT: ${{ vars.DEBUG_SNAPSHOT }}
-
-          # --- Playwright aan ---
+          # Playwright
           USE_PLAYWRIGHT: "1"
           LOGIN_USERNAME_SELECTOR: ${{ vars.LOGIN_USERNAME_SELECTOR }}
           LOGIN_PASSWORD_SELECTOR: ${{ vars.LOGIN_PASSWORD_SELECTOR }}
           LOGIN_SUBMIT_SELECTOR:   ${{ vars.LOGIN_SUBMIT_SELECTOR }}
-
-          # --- stille uren ---
+          # Quiet hours
           QUIET_TZ: "Europe/Amsterdam"
           QUIET_START: "00:00"
           QUIET_END:   "06:32"
-
-          # --- random interval ---
+          # Random sleep
           MIN_SLEEP_SEC: "60"
           MAX_SLEEP_SEC: "300"
-
-          # --- test mode bron ---
+          # Test mode sources
           INPUT_TEST_MODE: ${{ github.event.inputs.test_mode }}
           VARS_TEST_MODE:  ${{ vars.TEST_MODE }}
         shell: bash
@@ -95,9 +90,7 @@ jobs:
             local min="${MIN_SLEEP_SEC:-60}"
             local max="${MAX_SLEEP_SEC:-300}"
             local dur
-            if [ "$max" -le "$min" ]; then
-              dur="$min"
-            else
+            if [ "$max" -le "$min" ]; then dur="$min"; else
               local range=$((max - min + 1))
               local offset=$(( RANDOM % range ))
               dur=$(( min + offset ))
@@ -109,11 +102,7 @@ jobs:
           sleep_until_quiet_end () {
             NOW_NUM=$(TZ=$QUIET_TZ date +%H%M)
             END_NUM=$(echo "$QUIET_END" | tr -d :)
-            if [ "$NOW_NUM" -lt "$END_NUM" ]; then
-              day="today"
-            else
-              day="tomorrow"
-            fi
+            if [ "$NOW_NUM" -lt "$END_NUM" ]; then day="today"; else day="tomorrow"; fi
             end_ts=$(TZ=$QUIET_TZ date -d "$day $QUIET_END" +%s)
             now_ts=$(date +%s)
             sleep_for=$(( end_ts - now_ts ))
@@ -135,12 +124,9 @@ jobs:
           }
 
           while [ $(date +%s) -lt $END ]; do
-            if is_in_quiet; then
-              sleep_until_quiet_end
-              continue
-            fi
+            if is_in_quiet; then sleep_until_quiet_end; continue; fi
 
-            # DEBUG: toon dat de env-vars echt doorkomen
+            # DEBUG: laat zien dat env-vars echt doorkomen
             echo "DEBUG_SNAPSHOT=$DEBUG_SNAPSHOT  USE_PLAYWRIGHT=$USE_PLAYWRIGHT"
             python -c 'import os; print("PY DEBUG_SNAPSHOT =", os.getenv("DEBUG_SNAPSHOT")); print("PY USE_PLAYWRIGHT =", os.getenv("USE_PLAYWRIGHT"))'
 
