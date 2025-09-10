@@ -7,6 +7,10 @@ on:
         description: "TEST-modus: stuur push bij GEEN verandering (1=aan, 0=uit)"
         required: false
         default: "0"
+      loops:
+        description: "Aantal checks in deze run (voor testen 1)"
+        required: false
+        default: "1"
   schedule:
     - cron: "0 */6 * * *"
 
@@ -21,7 +25,7 @@ concurrency:
 jobs:
   loop:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 60   # test-run hoeft geen 6 uur meer
 
     steps:
       - name: Checkout
@@ -40,7 +44,7 @@ jobs:
       - name: Install Playwright browsers
         run: python -m playwright install --with-deps chromium
 
-      - name: Run loop (quiet hours + random interval + TEST-mode + Playwright)
+      - name: Run checks (one-shot friendly) + Playwright
         env:
           # secrets
           LOGIN_URL: ${{ secrets.LOGIN_URL }}
@@ -65,27 +69,22 @@ jobs:
           LOGIN_USERNAME_SELECTOR: ${{ vars.LOGIN_USERNAME_SELECTOR }}
           LOGIN_PASSWORD_SELECTOR: ${{ vars.LOGIN_PASSWORD_SELECTOR }}
           LOGIN_SUBMIT_SELECTOR:   ${{ vars.LOGIN_SUBMIT_SELECTOR }}
-          # Quiet hours
+          # Quiet hours (blijft actief, maar je kiest zelf wanneer je runt)
           QUIET_TZ: "Europe/Amsterdam"
           QUIET_START: "00:00"
           QUIET_END:   "06:32"
           # Random sleep
           MIN_SLEEP_SEC: "60"
           MAX_SLEEP_SEC: "300"
-          # Test mode sources
+          # Test mode + aantal loops
           INPUT_TEST_MODE: ${{ github.event.inputs.test_mode }}
           VARS_TEST_MODE:  ${{ vars.TEST_MODE }}
+          LOOPS: ${{ github.event.inputs.loops }}
         shell: bash
         run: |
           set -e
-          END=$(( $(date +%s) + 20700 ))
 
-          TEST_MODE="${INPUT_TEST_MODE:-${VARS_TEST_MODE:-0}}"
-          echo "TEST_MODE=${TEST_MODE}"
-
-          git config user.email "actions@users.noreply.github.com"
-          git config user.name "github-actions"
-
+          # ------ helpers ------
           random_sleep () {
             local min="${MIN_SLEEP_SEC:-60}"
             local max="${MAX_SLEEP_SEC:-300}"
@@ -123,16 +122,43 @@ jobs:
             fi
           }
 
-          while [ $(date +%s) -lt $END ]; do
-            if is_in_quiet; then sleep_until_quiet_end; continue; fi
+          TEST_MODE="${INPUT_TEST_MODE:-${VARS_TEST_MODE:-0}}"
+          echo "TEST_MODE=${TEST_MODE}"
+          echo "DEBUG_SNAPSHOT=$DEBUG_SNAPSHOT  USE_PLAYWRIGHT=$USE_PLAYWRIGHT"
+          python -c 'import os; print("PY DEBUG_SNAPSHOT =", os.getenv("DEBUG_SNAPSHOT")); print("PY USE_PLAYWRIGHT =", os.getenv("USE_PLAYWRIGHT"))'
 
-            # DEBUG: laat zien dat env-vars echt doorkomen
-            echo "DEBUG_SNAPSHOT=$DEBUG_SNAPSHOT  USE_PLAYWRIGHT=$USE_PLAYWRIGHT"
-            python -c 'import os; print("PY DEBUG_SNAPSHOT =", os.getenv("DEBUG_SNAPSHOT")); print("PY USE_PLAYWRIGHT =", os.getenv("USE_PLAYWRIGHT"))'
+          git config user.email "actions@users.noreply.github.com"
+          git config user.name "github-actions"
 
-            echo "::group::check $(date -u +%F'T'%T'Z')"
+          max_loops="${LOOPS:-1}"
+          if ! [[ "$max_loops" =~ ^[0-9]+$ ]]; then max_loops=1; fi
+          i=1
+
+          while [ $i -le $max_loops ]; do
+            if is_in_quiet; then sleep_until_quiet_end; fi
+
+            echo "::group::check $i / $max_loops @ $(date -u +%F'T'%T'Z')"
+            rm -f last_response.html last_response.png || true
+
             python checker.py | tee run.log || true
 
+            # Fallback: forceer een snapshot-bestand voor upload/debug
+            if [ "${DEBUG_SNAPSHOT}" = "1" ] && [ ! -f last_response.html ]; then
+              {
+                echo "<html><body>"
+                echo "<h3>No HTML snapshot created by checker.py</h3>"
+                echo "<p>See run.log included in the artifact for details.</p>"
+                echo "</body></html>"
+              } > last_response.html
+              echo "Created fallback last_response.html"
+            fi
+
+            # Toon even wat er ligt
+            echo "---- ls -la ----"
+            ls -la | sed -n '1,200p'
+            echo "---------------"
+
+            # Commit state.json alleen bij wijziging
             if grep -q "STATE_CHANGED=1" run.log; then
               git pull --rebase || true
               git add state.json
@@ -141,6 +167,7 @@ jobs:
             fi
             echo "::endgroup::"
 
+            # TEST-mode heartbeat als géén verandering
             if [ "$TEST_MODE" = "1" ] || [ "$TEST_MODE" = "true" ] || [ "$TEST_MODE" = "yes" ]; then
               if ! grep -q "STATE_CHANGED=1" run.log; then
                 STATUS_LINE=$(grep -E '^Status:' run.log | tail -n1 || true)
@@ -153,10 +180,11 @@ jobs:
               fi
             fi
 
-            random_sleep
+            if [ $i -lt $max_loops ]; then random_sleep; fi
+            i=$((i+1))
           done
 
-      - name: Upload snapshot (if present)
+      - name: Upload snapshot + log (if present)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -164,21 +192,5 @@ jobs:
           path: |
             last_response.html
             last_response.png
+            run.log
           if-no-files-found: ignore
-
-      - name: Self-dispatch next daemon run (preserve TEST-mode)
-        if: always()
-        env:
-          GH_OWNER_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ github.token }}
-          REF_NAME: ${{ github.ref_name }}
-          INPUT_TEST_MODE: ${{ github.event.inputs.test_mode }}
-          VARS_TEST_MODE:  ${{ vars.TEST_MODE }}
-        run: |
-          TEST_MODE="${INPUT_TEST_MODE:-${VARS_TEST_MODE:-0}}"
-          PAYLOAD=$(printf '{"ref":"%s","inputs":{"test_mode":"%s"}}' "$REF_NAME" "$TEST_MODE")
-          curl -sS -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -d "$PAYLOAD" \
-            "https://api.github.com/repos/${GH_OWNER_REPO}/actions/workflows/check_daemon.yml/dispatches" || true
