@@ -8,11 +8,11 @@ on:
         required: false
         default: "0"
       test_loop:
-        description: "TEST-loop: draai slechts 1 check (1=aan, 0=uit)"
+        description: "TEST-loop: maar 1 check (1=aan, 0=uit)"
         required: false
         default: "0"
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */6 * * *" # backup trigger
 
 permissions:
   contents: write
@@ -25,15 +25,14 @@ concurrency:
 jobs:
   loop:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 330
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -41,11 +40,12 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Install Playwright browsers
+      - name: Install Playwright
         run: python -m playwright install --with-deps chromium
 
-      - name: Run (test-loop óf daemon) + Playwright
+      - name: Run (test of daemon)
         env:
+          # --- secrets ---
           LOGIN_URL: ${{ secrets.LOGIN_URL }}
           TARGET_URL: ${{ secrets.TARGET_URL }}
           SITE_USERNAME: ${{ secrets.SITE_USERNAME }}
@@ -56,21 +56,28 @@ jobs:
           TEXT_TO_FIND: ${{ secrets.TEXT_TO_FIND }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          JITTER_SECONDS_MAX: "10"
+
+          # --- variables ---
           EXPECTED_HOST: ${{ vars.EXPECTED_HOST }}
           EXPECTED_PATH: ${{ vars.EXPECTED_PATH }}
           CONFIRM_TEXT:  ${{ vars.CONFIRM_TEXT }}
           CSS_SELECTOR:  ${{ vars.CSS_SELECTOR }}
           DEBUG_SNAPSHOT: ${{ vars.DEBUG_SNAPSHOT }}
-          USE_PLAYWRIGHT: "1"
+
+          # login selector overrides (optioneel)
           LOGIN_USERNAME_SELECTOR: ${{ vars.LOGIN_USERNAME_SELECTOR }}
           LOGIN_PASSWORD_SELECTOR: ${{ vars.LOGIN_PASSWORD_SELECTOR }}
           LOGIN_SUBMIT_SELECTOR:   ${{ vars.LOGIN_SUBMIT_SELECTOR }}
-          QUIET_TZ: "Europe/Amsterdam"
-          QUIET_START: "00:00"
-          QUIET_END:   "06:32"
+
+          # --- gedrag ---
+          USE_PLAYWRIGHT: "1"            # zet op "0" als je requests-fallback wilt forceren
           MIN_SLEEP_SEC: "60"
           MAX_SLEEP_SEC: "300"
+          QUIET_TZ: "Europe/Amsterdam"
+          QUIET_START: "00:07"
+          QUIET_END:   "06:28"
+
+          # --- inputs ---
           INPUT_TEST_MODE: ${{ github.event.inputs.test_mode }}
           INPUT_TEST_LOOP: ${{ github.event.inputs.test_loop }}
         shell: bash
@@ -90,20 +97,7 @@ jobs:
             sleep "$dur"
           }
 
-          sleep_until_quiet_end () {
-            NOW_NUM=$(TZ=$QUIET_TZ date +%H%M)
-            END_NUM=$(echo "$QUIET_END" | tr -d :)
-            if [ "$NOW_NUM" -lt "$END_NUM" ]; then day="today"; else day="tomorrow"; fi
-            end_ts=$(TZ=$QUIET_TZ date -d "$day $QUIET_END" +%s)
-            now_ts=$(date +%s)
-            sleep_for=$(( end_ts - now_ts ))
-            if [ $sleep_for -gt 0 ]; then
-              echo "Quiet hours ($QUIET_START-$QUIET_END $QUIET_TZ). Sleeping $sleep_for s..."
-              sleep $sleep_for
-            fi
-          }
-
-          is_in_quiet () {
+          in_quiet () {
             NOW=$(TZ=$QUIET_TZ date +%H%M)
             START=$(echo "$QUIET_START" | tr -d :)
             ENDHM=$(echo "$QUIET_END" | tr -d :)
@@ -114,30 +108,31 @@ jobs:
             fi
           }
 
+          sleep_until_quiet_end () {
+            NOW_NUM=$(TZ=$QUIET_TZ date +%H%M)
+            END_NUM=$(echo "$QUIET_END" | tr -d :)
+            if [ "$NOW_NUM" -lt "$END_NUM" ]; then day="today"; else day="tomorrow"; fi
+            end_ts=$(TZ=$QUIET_TZ date -d "$day $QUIET_END" +%s)
+            now_ts=$(date +%s)
+            wait=$(( end_ts - now_ts ))
+            echo "Quiet hours: sleeping $wait s until $QUIET_END $QUIET_TZ ..."
+            sleep $wait
+          }
+
           TEST_MODE="${INPUT_TEST_MODE:-0}"
           TEST_LOOP="${INPUT_TEST_LOOP:-0}"
-          echo "TEST_MODE=${TEST_MODE}"
-          echo "TEST_LOOP=${TEST_LOOP}"
-          echo "DEBUG_SNAPSHOT=$DEBUG_SNAPSHOT  USE_PLAYWRIGHT=$USE_PLAYWRIGHT"
-          python -c 'import os; print("PY DEBUG_SNAPSHOT =", os.getenv("DEBUG_SNAPSHOT")); print("PY USE_PLAYWRIGHT =", os.getenv("USE_PLAYWRIGHT"))'
+          echo "TEST_MODE=$TEST_MODE  TEST_LOOP=$TEST_LOOP"
+          python -c 'import os;print("PY DEBUG_SNAPSHOT=",os.getenv("DEBUG_SNAPSHOT"));print("PY USE_PLAYWRIGHT=",os.getenv("USE_PLAYWRIGHT"))'
 
           git config user.email "actions@users.noreply.github.com"
           git config user.name "github-actions"
 
-          run_one_check () {
-            rm -f last_response.html last_response.png || true
-            # Belangrijk: stderr -> stdout zodat alles in run.log komt
+          run_one () {
+            rm -f last_response.html last_response.png after_submit.png run.log || true
+            # stderr -> stdout
             python checker.py 2>&1 | tee run.log || true
 
-            # Fallback snapshot voor artifact
-            if [ "${DEBUG_SNAPSHOT}" = "1" ] && [ ! -f last_response.html ]; then
-              {
-                echo "<html><body><h3>No HTML snapshot created by checker.py</h3><p>See run.log for details.</p></body></html>"
-              } > last_response.html
-              echo "Created fallback last_response.html"
-            fi
-
-            # commit state.json alleen bij wijziging
+            # als state is gewijzigd, committen
             if grep -q "STATE_CHANGED=1" run.log; then
               git pull --rebase || true
               git add state.json
@@ -145,7 +140,7 @@ jobs:
               git push || true
             fi
 
-            # TEST heartbeat bij géén verandering
+            # test heartbeat
             if [ "$TEST_MODE" = "1" ] || [ "$TEST_MODE" = "true" ] || [ "$TEST_MODE" = "yes" ]; then
               if ! grep -q "STATE_CHANGED=1" run.log; then
                 STATUS_LINE=$(grep -E '^Status:' run.log | tail -n1 || true)
@@ -160,21 +155,23 @@ jobs:
           }
 
           if [ "$TEST_LOOP" = "1" ]; then
-            echo "::group::check 1/1 @ $(date -u +%F'T'%T'Z')"
-            run_one_check
+            echo "::group::check 1/1"
+            if in_quiet; then echo "In quiet hours → single sleep until end"; sleep_until_quiet_end; fi
+            run_one
             echo "::endgroup::"
           else
-            END=$(( $(date +%s) + 20700 ))
+            # +- 5u30 (19800s)
+            END=$(( $(date +%s) + 19800 ))
             while [ $(date +%s) -lt $END ]; do
-              if is_in_quiet; then sleep_until_quiet_end; continue; fi
-              echo "::group::check @ $(date -u +%F'T'%T'Z')"
-              run_one_check
+              if in_quiet; then sleep_until_quiet_end; continue; fi
+              echo "::group::check @ $(date -u +%F' '%T) UTC"
+              run_one
               echo "::endgroup::"
               random_sleep
             done
           fi
 
-      - name: Upload snapshot + log (if present)
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -182,19 +179,19 @@ jobs:
           path: |
             last_response.html
             last_response.png
+            after_submit.png
             run.log
           if-no-files-found: ignore
 
-      - name: Self-dispatch next daemon run (only when NOT in test-loop)
+      - name: Self-dispatch next daemon run (skip in TEST_LOOP)
         if: ${{ github.event.inputs.test_loop == '0' }}
         env:
-          GH_OWNER_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ github.token }}
-          REF_NAME: ${{ github.ref_name }}
-          INPUT_TEST_MODE: ${{ github.event.inputs.test_mode }}
+            GH_OWNER_REPO: ${{ github.repository }}
+            GH_TOKEN: ${{ github.token }}
+            REF_NAME: ${{ github.ref_name }}
+            INPUT_TEST_MODE: ${{ github.event.inputs.test_mode }}
         run: |
-          TEST_MODE="${INPUT_TEST_MODE:-0}"
-          PAYLOAD=$(printf '{"ref":"%s","inputs":{"test_mode":"%s","test_loop":"0"}}' "$REF_NAME" "$TEST_MODE")
+          PAYLOAD=$(printf '{"ref":"%s","inputs":{"test_mode":"%s","test_loop":"0"}}' "$REF_NAME" "${INPUT_TEST_MODE:-0}")
           curl -sS -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $GH_TOKEN" \
