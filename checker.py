@@ -1,4 +1,4 @@
-import os, sys, time, json, re
+import os, sys, time, json, re, traceback
 from html import unescape
 from urllib.parse import urlparse
 import requests
@@ -32,9 +32,9 @@ DEBUG_SNAPSHOT  = os.getenv("DEBUG_SNAPSHOT", "0") == "1"
 USE_PLAYWRIGHT  = os.getenv("USE_PLAYWRIGHT", "0") == "1"
 
 # Optioneel voor Playwright-login (als de standaard name= velden niet werken)
-LOGIN_USERNAME_SELECTOR = os.getenv("LOGIN_USERNAME_SELECTOR")  # bv: input[name="email"]
-LOGIN_PASSWORD_SELECTOR = os.getenv("LOGIN_PASSWORD_SELECTOR")  # bv: input[type="password"]
-LOGIN_SUBMIT_SELECTOR   = os.getenv("LOGIN_SUBMIT_SELECTOR")    # bv: button[type="submit"]
+LOGIN_USERNAME_SELECTOR = os.getenv("LOGIN_USERNAME_SELECTOR")
+LOGIN_PASSWORD_SELECTOR = os.getenv("LOGIN_PASSWORD_SELECTOR")
+LOGIN_SUBMIT_SELECTOR   = os.getenv("LOGIN_SUBMIT_SELECTOR")
 
 def _json_env(name, default):
     raw = os.getenv(name)
@@ -45,7 +45,7 @@ def _json_env(name, default):
     except json.JSONDecodeError:
         return default
 
-EXTRA_FIELDS = _json_env("EXTRA_FIELDS_JSON", {})  # voor requests-flow indien nodig
+EXTRA_FIELDS = _json_env("EXTRA_FIELDS_JSON", {})
 
 # kleine beleefdheids-pauze (jitter)
 if JITTER_MAX > 0:
@@ -64,6 +64,7 @@ def looks_like_login_page(html: str) -> bool:
 
 def url_checks(final_url: str) -> bool:
     ok = True
+    from urllib.parse import urlparse
     if EXPECTED_HOST:
         host = (urlparse(final_url).hostname or "").lower()
         if host != EXPECTED_HOST.lower():
@@ -133,8 +134,10 @@ def fetch_via_playwright():
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(user_agent=USER_AGENT)
         page = context.new_page()
-        # probeer direct target
+
         page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
+
+        # Login flow indien nodig
         if "login" in page.url.lower() or page.locator('input[type="password"]').count() > 0:
             page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
             if LOGIN_USERNAME_SELECTOR and LOGIN_PASSWORD_SELECTOR:
@@ -151,7 +154,6 @@ def fetch_via_playwright():
             page.wait_for_load_state("networkidle", timeout=60000)
             page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
 
-        # indien selector meegegeven: wacht er even op
         sel_text = ""
         if CSS_SELECTOR:
             try:
@@ -194,7 +196,6 @@ def main():
         if not os.getenv(req):
             print(f"Missing env: {req}", file=sys.stderr); return 2
 
-    # haal pagina
     selected_text = ""
     png_written = False
     if USE_PLAYWRIGHT:
@@ -228,10 +229,10 @@ def main():
     else:
         relevant = extract_relevant_text(full_text)
 
-    # availability met normalisatie (spaties/case negeren)
+    # availability met normalisatie
     available = normalize(TEXT_TO_FIND) not in normalize(relevant)
 
-    # de-dupe
+    # de-dupe + push
     state = load_state()
     prev = state.get("available")
     if available and prev is not True:
@@ -249,4 +250,10 @@ def main():
     return 0
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception:
+        # Zorg dat fouten altijd in stdout/tee/run.log belanden
+        print("UNCAUGHT EXCEPTION:", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)
