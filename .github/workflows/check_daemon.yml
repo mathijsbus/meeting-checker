@@ -142,6 +142,15 @@ jobs:
               continue
             fi
 
+            # ---- DEBUG: laat in de logs zien dat beide env-vars doorkomen ----
+            echo "DEBUG_SNAPSHOT=$DEBUG_SNAPSHOT  USE_PLAYWRIGHT=$USE_PLAYWRIGHT"
+            python - <<'PY'
+import os
+print("PY DEBUG_SNAPSHOT =", os.getenv("DEBUG_SNAPSHOT"))
+print("PY USE_PLAYWRIGHT =", os.getenv("USE_PLAYWRIGHT"))
+PY
+            # ------------------------------------------------------------------
+
             echo "::group::check $(date -u +%F'T'%T'Z')"
             python checker.py | tee run.log || true
 
