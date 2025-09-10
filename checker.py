@@ -4,7 +4,9 @@ import time
 import json
 import re
 from html import unescape
+from urllib.parse import urlparse
 import requests
+from bs4 import BeautifulSoup
 
 # ===================== Config uit env / Secrets =====================
 
@@ -14,17 +16,27 @@ USERNAME        = os.getenv("SITE_USERNAME")
 PASSWORD        = os.getenv("SITE_PASSWORD")
 USERNAME_FIELD  = os.getenv("USERNAME_FIELD", "username")     # pas aan indien anders
 PASSWORD_FIELD  = os.getenv("PASSWORD_FIELD", "password")     # pas aan indien anders
+
 TEXT_TO_FIND    = os.getenv("TEXT_TO_FIND", "Geen dagen gevonden.")
-# Optioneel: tekst die ALTIJD op de ECHTE afsprakenpagina staat (kopje, label e.d.)
-CONFIRM_TEXT    = os.getenv("CONFIRM_TEXT", "").strip()
+CONFIRM_TEXT    = (os.getenv("CONFIRM_TEXT") or "").strip()   # optioneel: vaste tekst die altijd op de slots-pagina staat
+
+# *** NIEUW: richt preciezer ***
+EXPECTED_HOST   = (os.getenv("EXPECTED_HOST") or "").strip()  # bv. 'mijnsite.nl'  (optioneel maar sterk aangeraden)
+EXPECTED_PATH   = (os.getenv("EXPECTED_PATH") or "").strip()  # bv. '/afspraak'    (optioneel substring match)
+CSS_SELECTOR    = (os.getenv("CSS_SELECTOR") or "").strip()   # bv. '#slots-message' of '.calendar-status' (aanrader)
+
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHATID = os.getenv("TELEGRAM_CHAT_ID")
+
 USER_AGENT      = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 JITTER_MAX      = int(os.getenv("JITTER_SECONDS_MAX", "5"))  # kleine willekeurige pauze
 STATE_FILE      = "state.json"  # de-dupe (alleen push bij status-wijziging)
+
+# Debug/snapshot (artifact)
+DEBUG_SNAPSHOT  = os.getenv("DEBUG_SNAPSHOT", "0") == "1"     # als 1: sla last_response.html op voor inspectie
 
 # ===== Tolerant inlezen van EXTRA_FIELDS_JSON (mag leeg zijn) =====
 def _json_env(name: str, default):
@@ -49,16 +61,6 @@ if JITTER_MAX > 0:
 LOGIN_HINTS = (
     "wachtwoord", "password", "inloggen", "aanmelden", "login", 'type="password"'
 )
-
-MONTHS_NL = "jan|feb|mrt|apr|mei|jun|jul|aug|sep|okt|nov|dec"
-MONTHS_EN = "jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec"
-
-DATE_PATTERNS = [
-    rf"\b\d{{1,2}}\s*(?:{MONTHS_NL}|{MONTHS_EN})\b",  # 5 sep / 5 okt / 5 oct
-    r"\b\d{4}-\d{2}-\d{2}\b",                        # 2025-09-03
-    r"\b\d{1,2}/\d{1,2}/\d{2,4}\b",                  # 3/9/2025
-]
-TIME_PATTERN = r"\b\d{1,2}:\d{2}\b"                  # 09:30
 
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -138,18 +140,33 @@ def fetch_target(session: requests.Session):
 
     return r.text, r.url, login_attempted
 
-def hints_of_real_slots_page(html: str) -> bool:
-    """Alleen gebruiken *voor* we pushen: voorkom valse positieven.
-       True als de content plausibel bij een 'slots/agenda'-pagina hoort."""
-    lowered = html.lower()
-    # Als gebruiker CONFIRM_TEXT zet, moet die aanwezig zijn
-    if CONFIRM_TEXT:
-        if CONFIRM_TEXT.lower() not in lowered:
-            return False
-    # Anders: heuristiek – zoek naar datum/tijd of woorden die vaak voorkomen
-    date_like = any(re.search(pat, lowered) for pat in DATE_PATTERNS) or re.search(TIME_PATTERN, lowered)
-    context_words = any(w in lowered for w in ("afspraak", "agenda", "kalender", "beschikbaar", "dagen", "slots", "datum"))
-    return bool(date_like or context_words)
+def url_checks(final_url: str) -> bool:
+    """Controleer dat we op het juiste domein/pad zitten (als EXPECTED_* gezet is)."""
+    ok = True
+    if EXPECTED_HOST:
+        host = urlparse(final_url).hostname or ""
+        if host.lower() != EXPECTED_HOST.lower():
+            print(f"URL check failed: host '{host}' != EXPECTED_HOST '{EXPECTED_HOST}'", file=sys.stderr)
+            ok = False
+    if ok and EXPECTED_PATH:
+        path = urlparse(final_url).path or ""
+        if EXPECTED_PATH not in path:
+            print(f"URL check failed: path '{path}' mist EXPECTED_PATH '{EXPECTED_PATH}'", file=sys.stderr)
+            ok = False
+    return ok
+
+def extract_relevant_text(html: str) -> str:
+    """Pak ofwel de hele tekst, of (liever) de tekst uit een specifiek element."""
+    if CSS_SELECTOR:
+        soup = BeautifulSoup(html, "html.parser")
+        node = soup.select_one(CSS_SELECTOR)
+        if not node:
+            print(f"CSS selector '{CSS_SELECTOR}' niet gevonden; val terug op hele document.", file=sys.stderr)
+            return soup.get_text(separator=" ", strip=True)
+        return node.get_text(separator=" ", strip=True)
+    # fallback: hele documenttekst
+    soup = BeautifulSoup(html, "html.parser")
+    return soup.get_text(separator=" ", strip=True)
 
 def load_state():
     try:
@@ -179,26 +196,46 @@ def main():
         s.headers.update({"User-Agent": USER_AGENT})
         html, final_url, login_attempted = fetch_target(s)
 
-    text = unescape(html)
+    # Snapshot voor inspectie (optioneel)
+    if DEBUG_SNAPSHOT:
+        try:
+            with open("last_response.html", "w", encoding="utf-8") as f:
+                f.write(html)
+            print("SNAPSHOT_SAVED=1")
+        except Exception as e:
+            print(f"Snapshot failed: {e}", file=sys.stderr)
 
-    # 1) Als we nog steeds op login-achtige content zitten → NIET alerten
-    if looks_like_login_page(text):
+    text_full = unescape(html)
+
+    # 0) Niet op loginpagina blijven hangen
+    if looks_like_login_page(text_full):
         print("Op loginpagina terechtgekomen; geen alert. (Controleer USERNAME_FIELD/PASSWORD_FIELD/EXTRA_FIELDS_JSON.)")
         print(f"Final URL: {final_url}")
         return 0
 
-    # 2) Bepaal availability: als de “geen dagen”-zin NIET voorkomt, is het mogelijk beschikbaar
-    candidate_available = (TEXT_TO_FIND not in text)
+    # 1) URL-check (indien ingesteld)
+    if not url_checks(final_url):
+        print(f"Final URL (mismatch): {final_url}")
+        return 0
 
-    # 3) Alleen pushen als we sterke aanwijzing hebben dat dit écht de afsprakenpagina is
-    will_alert = candidate_available and hints_of_real_slots_page(text)
+    # 2) Pagina-check: CONFIRM_TEXT (indien ingesteld)
+    lowered = text_full.lower()
+    if CONFIRM_TEXT and (CONFIRM_TEXT.lower() not in lowered):
+        print(f"CONFIRM_TEXT '{CONFIRM_TEXT}' niet gevonden; geen alert.")
+        print(f"Final URL: {final_url}")
+        return 0
+
+    # 3) Element-check: kijk gericht in CSS_SELECTOR of het hele document
+    relevant_text = extract_relevant_text(text_full)
+
+    # Beschikbaarheid: als de “geen dagen” tekst NIET voorkomt in het relevante stuk, dan lijkt het beschikbaar
+    available = (TEXT_TO_FIND not in relevant_text)
 
     # De-dupe op basis van state.json
     state = load_state()
     prev = state.get("available")
-    available = bool(will_alert)  # 'beschikbaar' definiëren we nu als 'we zouden alerten'
 
-    if will_alert and prev is not True:
+    if available and prev is not True:
         send_telegram("🎉 Er lijken data beschikbaar! Check de site nu.")
         print("Notificatie verstuurd.")
 
@@ -206,12 +243,18 @@ def main():
         save_state({"available": available})
         print("STATE_CHANGED=1")
 
+    # Logging ter controle
     print(f"Status: {'BESCHIKBAAR' if available else 'GEEN'}")
     print(f"Final URL: {final_url}")
     if login_attempted:
         print("Login attempted: yes")
     else:
         print("Login attempted: no")
+
+    # Extra logging: een klein fragment rondom TEXT_TO_FIND of eerste chars van relevant
+    snippet = relevant_text[:300].replace("\n", " ")
+    print(f"Relevant snippet (first 300 chars): {snippet}")
+
     return 0
 
 if __name__ == "__main__":
