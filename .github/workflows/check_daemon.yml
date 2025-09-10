@@ -24,7 +24,8 @@ jobs:
     timeout-minutes: 355
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -39,7 +40,7 @@ jobs:
       - name: Install Playwright browsers
         run: python -m playwright install --with-deps chromium
 
-      - name: Run loop (quiet hours + random interval + optional TEST-mode + Playwright)
+      - name: Run loop (quiet hours + random interval + TEST-mode + Playwright)
         env:
           # --- secrets ---
           LOGIN_URL: ${{ secrets.LOGIN_URL }}
@@ -79,6 +80,7 @@ jobs:
           # --- test mode bron ---
           INPUT_TEST_MODE: ${{ github.event.inputs.test_mode }}
           VARS_TEST_MODE:  ${{ vars.TEST_MODE }}
+        shell: bash
         run: |
           set -e
           END=$(( $(date +%s) + 20700 ))
@@ -100,7 +102,7 @@ jobs:
               local offset=$(( RANDOM % range ))
               dur=$(( min + offset ))
             fi
-            echo "🕒 Sleeping ${dur}s before next check..."
+            echo "Sleeping ${dur}s before next check..."
             sleep "$dur"
           }
 
@@ -116,7 +118,7 @@ jobs:
             now_ts=$(date +%s)
             sleep_for=$(( end_ts - now_ts ))
             if [ $sleep_for -gt 0 ]; then
-              echo "⏸  Quiet hours ($QUIET_START–$QUIET_END $QUIET_TZ). Sleeping $sleep_for s until $day $QUIET_END $QUIET_TZ…"
+              echo "Quiet hours ($QUIET_START-$QUIET_END $QUIET_TZ). Sleeping $sleep_for s..."
               sleep $sleep_for
             fi
           }
@@ -138,14 +140,9 @@ jobs:
               continue
             fi
 
-            # ======= DEBUG-REGELS (voor deze test) =======
+            # DEBUG: toon dat de env-vars echt doorkomen
             echo "DEBUG_SNAPSHOT=$DEBUG_SNAPSHOT  USE_PLAYWRIGHT=$USE_PLAYWRIGHT"
-            python - <<'PY'
-import os
-print("PY DEBUG_SNAPSHOT =", os.getenv("DEBUG_SNAPSHOT"))
-print("PY USE_PLAYWRIGHT =", os.getenv("USE_PLAYWRIGHT"))
-PY
-            # ============================================
+            python -c 'import os; print("PY DEBUG_SNAPSHOT =", os.getenv("DEBUG_SNAPSHOT")); print("PY USE_PLAYWRIGHT =", os.getenv("USE_PLAYWRIGHT"))'
 
             echo "::group::check $(date -u +%F'T'%T'Z')"
             python checker.py | tee run.log || true
@@ -162,7 +159,7 @@ PY
               if ! grep -q "STATE_CHANGED=1" run.log; then
                 STATUS_LINE=$(grep -E '^Status:' run.log | tail -n1 || true)
                 STATUS_TEXT="${STATUS_LINE#Status: }"
-                MSG="🔧 [TEST] Geen verandering (${STATUS_TEXT:-onbekend}) @ $(date -u +%F' '%T) UTC"
+                MSG="[TEST] Geen verandering (${STATUS_TEXT:-onbekend}) @ $(date -u +%F' '%T) UTC"
                 curl -sS -X POST \
                   -d "chat_id=${TELEGRAM_CHAT_ID}" \
                   -d "text=${MSG}" \
