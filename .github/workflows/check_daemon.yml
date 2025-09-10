@@ -1,20 +1,18 @@
 name: Check meeting page (daemon)
 
 on:
-  # Handmatig starten met keuze voor testmodus
   workflow_dispatch:
     inputs:
       test_mode:
         description: "TEST-modus: stuur push bij GEEN verandering (1=aan, 0=uit)"
         required: false
         default: "0"
-  # Back-up start (voor het geval self-dispatch faalt)
   schedule:
     - cron: "0 */6 * * *"
 
 permissions:
-  contents: write   # voor state.json commits
-  actions: write    # om zichzelf opnieuw te starten
+  contents: write
+  actions: write
 
 concurrency:
   group: meeting-checker-daemon
@@ -23,7 +21,7 @@ concurrency:
 jobs:
   loop:
     runs-on: ubuntu-latest
-    timeout-minutes: 355          # ~5u55 (GitHub-hosted limiet ~6u)
+    timeout-minutes: 355
 
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +41,7 @@ jobs:
 
       - name: Run loop (quiet hours + random interval + optional TEST-mode + Playwright)
         env:
-          # --- checker secrets ---
+          # --- secrets ---
           LOGIN_URL: ${{ secrets.LOGIN_URL }}
           TARGET_URL: ${{ secrets.TARGET_URL }}
           SITE_USERNAME: ${{ secrets.SITE_USERNAME }}
@@ -56,16 +54,15 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           JITTER_SECONDS_MAX: "10"
 
-          # --- precisie/validatie (repo Variables) ---
-          EXPECTED_HOST: ${{ vars.EXPECTED_HOST }}        # bv. pass.aviationmedical.com
-          EXPECTED_PATH: ${{ vars.EXPECTED_PATH }}        # bv. /testRounds/43
-          CONFIRM_TEXT:  ${{ vars.CONFIRM_TEXT }}         # bv. Kerncompetentieonderzoek
-          CSS_SELECTOR:  ${{ vars.CSS_SELECTOR }}         # bv. #app .MuiTableContainer-root table tbody td.MuiTableCell-body
-          DEBUG_SNAPSHOT: ${{ vars.DEBUG_SNAPSHOT }}      # 1 = ook HTML/PNG opslaan
+          # --- variables ---
+          EXPECTED_HOST: ${{ vars.EXPECTED_HOST }}
+          EXPECTED_PATH: ${{ vars.EXPECTED_PATH }}
+          CONFIRM_TEXT:  ${{ vars.CONFIRM_TEXT }}
+          CSS_SELECTOR:  ${{ vars.CSS_SELECTOR }}
+          DEBUG_SNAPSHOT: ${{ vars.DEBUG_SNAPSHOT }}
 
           # --- Playwright aan ---
           USE_PLAYWRIGHT: "1"
-          # (optioneel: expliciete login-selectors als nodig)
           LOGIN_USERNAME_SELECTOR: ${{ vars.LOGIN_USERNAME_SELECTOR }}
           LOGIN_PASSWORD_SELECTOR: ${{ vars.LOGIN_PASSWORD_SELECTOR }}
           LOGIN_SUBMIT_SELECTOR:   ${{ vars.LOGIN_SUBMIT_SELECTOR }}
@@ -75,18 +72,17 @@ jobs:
           QUIET_START: "00:00"
           QUIET_END:   "06:32"
 
-          # --- random interval (aanpasbaar) ---
-          MIN_SLEEP_SEC: "60"   # 1 min
-          MAX_SLEEP_SEC: "300"  # 5 min
+          # --- random interval ---
+          MIN_SLEEP_SEC: "60"
+          MAX_SLEEP_SEC: "300"
 
-          # --- TEST-modus bron: input of repo variable ---
+          # --- test mode bron ---
           INPUT_TEST_MODE: ${{ github.event.inputs.test_mode }}
           VARS_TEST_MODE:  ${{ vars.TEST_MODE }}
         run: |
           set -e
-          END=$(( $(date +%s) + 20700 ))   # ~5u45
+          END=$(( $(date +%s) + 20700 ))
 
-          # Bepaal effectieve TEST-modus (input > var > default 0)
           TEST_MODE="${INPUT_TEST_MODE:-${VARS_TEST_MODE:-0}}"
           echo "TEST_MODE=${TEST_MODE}"
 
@@ -142,19 +138,18 @@ jobs:
               continue
             fi
 
-            # ---- DEBUG: laat in de logs zien dat beide env-vars doorkomen ----
+            # ======= DEBUG-REGELS (voor deze test) =======
             echo "DEBUG_SNAPSHOT=$DEBUG_SNAPSHOT  USE_PLAYWRIGHT=$USE_PLAYWRIGHT"
             python - <<'PY'
 import os
 print("PY DEBUG_SNAPSHOT =", os.getenv("DEBUG_SNAPSHOT"))
 print("PY USE_PLAYWRIGHT =", os.getenv("USE_PLAYWRIGHT"))
 PY
-            # ------------------------------------------------------------------
+            # ============================================
 
             echo "::group::check $(date -u +%F'T'%T'Z')"
             python checker.py | tee run.log || true
 
-            # commit alleen bij status-wijziging
             if grep -q "STATE_CHANGED=1" run.log; then
               git pull --rebase || true
               git add state.json
@@ -163,7 +158,6 @@ PY
             fi
             echo "::endgroup::"
 
-            # TEST-modus: stuur heartbeat bij GEEN verandering
             if [ "$TEST_MODE" = "1" ] || [ "$TEST_MODE" = "true" ] || [ "$TEST_MODE" = "yes" ]; then
               if ! grep -q "STATE_CHANGED=1" run.log; then
                 STATUS_LINE=$(grep -E '^Status:' run.log | tail -n1 || true)
