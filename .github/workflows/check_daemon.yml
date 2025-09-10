@@ -40,7 +40,7 @@ jobs:
 
       - name: Run loop (quiet hours + random interval + optional TEST-mode)
         env:
-          # --- checker envs ---
+          # --- checker secrets ---
           LOGIN_URL: ${{ secrets.LOGIN_URL }}
           TARGET_URL: ${{ secrets.TARGET_URL }}
           SITE_USERNAME: ${{ secrets.SITE_USERNAME }}
@@ -52,6 +52,13 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           JITTER_SECONDS_MAX: "10"
+
+          # --- nieuwe Variables: precisie-checks ---
+          EXPECTED_HOST: ${{ vars.EXPECTED_HOST }}        # bv. pass.aviationmedical.com
+          EXPECTED_PATH: ${{ vars.EXPECTED_PATH }}        # bv. /testRounds/43
+          CONFIRM_TEXT:  ${{ vars.CONFIRM_TEXT }}         # bv. Kerncompetentieonderzoek
+          CSS_SELECTOR:  ${{ vars.CSS_SELECTOR }}         # bv. #app .MuiTableContainer-root table tbody td.MuiTableCell-body
+          DEBUG_SNAPSHOT: ${{ vars.DEBUG_SNAPSHOT }}      # zet var 1 voor snapshot, anders leeg/0
 
           # --- stille uren ---
           QUIET_TZ: "Europe/Amsterdam"
@@ -69,8 +76,7 @@ jobs:
           set -e
           END=$(( $(date +%s) + 20700 ))   # ~5u45
 
-          # Bepaal effectieve TEST-modus:
-          # 1) workflow_dispatch input, anders 2) repo variable TEST_MODE, anders 0
+          # Bepaal effectieve TEST-modus (input > var > default 0)
           TEST_MODE="${INPUT_TEST_MODE:-${VARS_TEST_MODE:-0}}"
           echo "TEST_MODE=${TEST_MODE}"
 
@@ -138,7 +144,7 @@ jobs:
             fi
             echo "::endgroup::"
 
-            # === TEST-modus: stuur heartbeat bij géén verandering ===
+            # TEST-modus: stuur heartbeat bij GEEN verandering
             if [ "$TEST_MODE" = "1" ] || [ "$TEST_MODE" = "true" ] || [ "$TEST_MODE" = "yes" ]; then
               if ! grep -q "STATE_CHANGED=1" run.log; then
                 STATUS_LINE=$(grep -E '^Status:' run.log | tail -n1 || true)
@@ -153,6 +159,15 @@ jobs:
 
             random_sleep
           done
+
+      # Upload de laatste HTML-snapshot als DEBUG_SNAPSHOT=1 stond en het bestand bestaat
+      - name: Upload snapshot (if present)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: last_response
+          path: last_response.html
+          if-no-files-found: ignore
 
       - name: Self-dispatch next daemon run (preserve TEST-mode)
         if: always()
