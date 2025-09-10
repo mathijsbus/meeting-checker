@@ -21,17 +21,20 @@ CSS_SELECTOR    = (os.getenv("CSS_SELECTOR") or "").strip()
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHATID = os.getenv("TELEGRAM_CHAT_ID")
-USER_AGENT      = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+USER_AGENT      = os.getenv(
+    "USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
 
 JITTER_MAX      = int(os.getenv("JITTER_SECONDS_MAX", "5"))
 STATE_FILE      = "state.json"
 DEBUG_SNAPSHOT  = os.getenv("DEBUG_SNAPSHOT", "0") == "1"
 USE_PLAYWRIGHT  = os.getenv("USE_PLAYWRIGHT", "0") == "1"
 
-# optionele selectors voor Playwright login
-LOGIN_USERNAME_SELECTOR = os.getenv("LOGIN_USERNAME_SELECTOR")  # bv input[name="username"]
-LOGIN_PASSWORD_SELECTOR = os.getenv("LOGIN_PASSWORD_SELECTOR")  # bv input[name="password"]
-LOGIN_SUBMIT_SELECTOR   = os.getenv("LOGIN_SUBMIT_SELECTOR")    # bv button[type="submit"]
+# Optioneel voor Playwright-login (als de standaard name= velden niet werken)
+LOGIN_USERNAME_SELECTOR = os.getenv("LOGIN_USERNAME_SELECTOR")  # bv: input[name="email"]
+LOGIN_PASSWORD_SELECTOR = os.getenv("LOGIN_PASSWORD_SELECTOR")  # bv: input[type="password"]
+LOGIN_SUBMIT_SELECTOR   = os.getenv("LOGIN_SUBMIT_SELECTOR")    # bv: button[type="submit"]
 
 def _json_env(name, default):
     raw = os.getenv(name)
@@ -42,9 +45,9 @@ def _json_env(name, default):
     except json.JSONDecodeError:
         return default
 
-EXTRA_FIELDS = _json_env("EXTRA_FIELDS_JSON", {})  # voor requests-flow
+EXTRA_FIELDS = _json_env("EXTRA_FIELDS_JSON", {})  # voor requests-flow indien nodig
 
-# kleine beleefdheids-pauze
+# kleine beleefdheids-pauze (jitter)
 if JITTER_MAX > 0:
     import random
     time.sleep(random.randint(0, JITTER_MAX))
@@ -72,7 +75,6 @@ def url_checks(final_url: str) -> bool:
     return ok
 
 def normalize(s: str) -> str:
-    # casefold + collapse whitespace + strip punctuation at ends
     return re.sub(r"\s+", " ", (s or "")).strip().casefold()
 
 def find_csrf(html: str):
@@ -87,6 +89,19 @@ def find_csrf(html: str):
         m = re.search(p, lower, re.I)
         if m: return m.group(1)
     return None
+
+def save_snapshot_files(html: str, png_exists: bool):
+    """Sla altijd last_response.html op als DEBUG_SNAPSHOT=1."""
+    if not DEBUG_SNAPSHOT:
+        return
+    try:
+        with open("last_response.html", "w", encoding="utf-8") as f:
+            f.write(html or "")
+        print("SNAPSHOT_SAVED=1")
+        if png_exists:
+            print("SNAPSHOT_PNG_PRESENT=1")
+    except Exception as e:
+        print(f"Snapshot failed: {e}", file=sys.stderr)
 
 # ---------- requests (non-JS) fallback ----------
 def fetch_via_requests():
@@ -108,12 +123,12 @@ def fetch_via_requests():
                 r = safe_get(s, TARGET_URL)
             else:
                 raise
-        # als nog login-achtig → geen goede content (JS-app)
         return r.text, r.url
 
 # ---------- Playwright (JS-rendered) ----------
 def fetch_via_playwright():
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    png_written = False
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(user_agent=USER_AGENT)
@@ -130,7 +145,6 @@ def fetch_via_playwright():
                 else:
                     page.keyboard.press("Enter")
             else:
-                # probeer via name= velden
                 page.fill(f'input[name="{USERNAME_FIELD}"]', USERNAME)
                 page.fill(f'input[name="{PASSWORD_FIELD}"]', PASSWORD)
                 page.keyboard.press("Enter")
@@ -141,7 +155,7 @@ def fetch_via_playwright():
         sel_text = ""
         if CSS_SELECTOR:
             try:
-                page.wait_for_selector(CSS_SELECTOR, timeout=10000)
+                page.wait_for_selector(CSS_SELECTOR, timeout=15000)
                 sel_text = page.text_content(CSS_SELECTOR) or ""
             except PWTimeout:
                 sel_text = ""
@@ -150,15 +164,14 @@ def fetch_via_playwright():
         final_url = page.url
 
         if DEBUG_SNAPSHOT:
-            with open("last_response.html", "w", encoding="utf-8") as f:
-                f.write(html)
             try:
                 page.screenshot(path="last_response.png", full_page=True)
+                png_written = True
             except Exception:
                 pass
 
         browser.close()
-        return html, final_url, sel_text
+        return html, final_url, sel_text, png_written
 
 def extract_relevant_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
@@ -183,10 +196,15 @@ def main():
 
     # haal pagina
     selected_text = ""
+    png_written = False
     if USE_PLAYWRIGHT:
-        html, final_url, selected_text = fetch_via_playwright()
+        html, final_url, selected_text, png_written = fetch_via_playwright()
     else:
         html, final_url = fetch_via_requests()
+
+    # Altijd HTML-snapshot wegschrijven als DEBUG aan staat
+    save_snapshot_files(html, png_written)
+
     full_text = unescape(html)
 
     # login-achtige content? dan stoppen
@@ -227,7 +245,7 @@ def main():
     print(f"Final URL: {final_url}")
     print("Relevant snippet (first 300 chars):", (relevant or "")[:300].replace("\n"," "))
     if DEBUG_SNAPSHOT:
-        print("SNAPSHOT_SAVED=1")
+        print("SNAPSHOT_DEBUG=on")
     return 0
 
 if __name__ == "__main__":
