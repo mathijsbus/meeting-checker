@@ -168,3 +168,155 @@ def fetch_via_playwright():
             # Kandidaten (eerst jouw expliciete, dan veelvoorkomende varianten)
             user_candidates = [LOGIN_USERNAME_SELECTOR] if LOGIN_USERNAME_SELECTOR else []
             user_candidates += [
+                'input[name="username"]',
+                'input[name="email"]',
+                'input[id*="user" i]',
+                'input[id*="email" i]',
+                'input[type="email"]',
+                'input[type="text"]',
+            ]
+            user_candidates = [s for s in user_candidates if s]
+
+            pass_candidates = [LOGIN_PASSWORD_SELECTOR] if LOGIN_PASSWORD_SELECTOR else []
+            pass_candidates += [
+                'input[name="password"]',
+                'input[id*="pass" i]',
+                'input[type="password"]',
+            ]
+            pass_candidates = [s for s in pass_candidates if s]
+
+            submit_candidates = [LOGIN_SUBMIT_SELECTOR] if LOGIN_SUBMIT_SELECTOR else []
+            # CSS + tekst selectors (NL/EN)
+            submit_candidates += [
+                'button[type="submit"]',
+                'input[type="submit"]',
+                'text=Login',
+                'text=Inloggen',
+                'text=Aanmelden',
+                'button:has-text("Login")',
+                'button:has-text("Inloggen")',
+                'button:has-text("Aanmelden")',
+            ]
+            submit_candidates = [s for s in submit_candidates if s]
+
+            sel_user = try_fill(page, user_candidates, USERNAME)
+            sel_pass = try_fill(page, pass_candidates, PASSWORD)
+            if not sel_user or not sel_pass:
+                raise RuntimeError(f"Could not find username/password fields. Tried: {user_candidates} / {pass_candidates}")
+
+            # Enter of klik
+            clicked = try_click(page, submit_candidates)
+            if not clicked:
+                # probeer Enter
+                page.keyboard.press("Enter")
+                print("Pressed Enter to submit.")
+
+            # wacht op navigatie (na login)
+            page.wait_for_load_state("networkidle", timeout=60000)
+            page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
+
+        # 3) Optioneel wachten op CSS_SELECTOR en inhoud pakken
+        sel_text = ""
+        if CSS_SELECTOR:
+            try:
+                page.wait_for_selector(CSS_SELECTOR, timeout=15000)
+                sel_text = page.text_content(CSS_SELECTOR) or ""
+                print(f"Captured CSS_SELECTOR content (len={len(sel_text)}).")
+            except PWTimeout:
+                print("CSS_SELECTOR not found within timeout.")
+
+        html = page.content()
+        final_url = page.url
+
+        if DEBUG_SNAPSHOT:
+            try:
+                page.screenshot(path="last_response.png", full_page=True)
+                png_written = True
+                print("Screenshot saved: last_response.png")
+            except Exception as e:
+                print(f"Screenshot failed: {e}", file=sys.stderr)
+
+        browser.close()
+        return html, final_url, sel_text, png_written
+
+def extract_relevant_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    return soup.get_text(separator=" ", strip=True)
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"available": None}
+
+def save_state(st):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=2)
+
+# ===================== main =====================
+def main():
+    for req in ("LOGIN_URL","TARGET_URL","SITE_USERNAME","SITE_PASSWORD","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"):
+        if not os.getenv(req):
+            print(f"Missing env: {req}", file=sys.stderr); return 2
+
+    selected_text = ""
+    png_written = False
+    if USE_PLAYWRIGHT:
+        html, final_url, selected_text, png_written = fetch_via_playwright()
+    else:
+        html, final_url = fetch_via_requests()
+
+    # Altijd HTML-snapshot wegschrijven als DEBUG aan staat
+    save_snapshot_files(html, png_written)
+
+    full_text = unescape(html)
+
+    # login-achtige content? dan stoppen
+    if looks_like_login_page(full_text):
+        print("Op loginpagina / niet-ingeladen content; geen alert.")
+        print(f"Final URL: {final_url}")
+        return 0
+
+    # URL + pagina-confirmaties
+    if not url_checks(final_url):
+        print(f"Final URL (mismatch): {final_url}")
+        return 0
+    if CONFIRM_TEXT and normalize(CONFIRM_TEXT) not in normalize(full_text):
+        print(f"CONFIRM_TEXT '{CONFIRM_TEXT}' niet gevonden; geen alert.")
+        print(f"Final URL: {final_url}")
+        return 0
+
+    # bepaal “relevant text”
+    if CSS_SELECTOR and selected_text:
+        relevant = selected_text
+    else:
+        relevant = extract_relevant_text(full_text)
+
+    # availability met normalisatie
+    available = normalize(TEXT_TO_FIND) not in normalize(relevant)
+
+    # de-dupe + push
+    state = load_state()
+    prev = state.get("available")
+    if available and prev is not True:
+        send_telegram("🎉 Er lijken data beschikbaar! Check de site nu.")
+        print("Notificatie verstuurd.")
+    if (prev is None) or (available != prev):
+        save_state({"available": available})
+        print("STATE_CHANGED=1")
+
+    print(f"Status: {'BESCHIKBAAR' if available else 'GEEN'}")
+    print(f"Final URL: {final_url}")
+    print("Relevant snippet (first 300 chars):", (relevant or "")[:300].replace("\n"," "))
+    if DEBUG_SNAPSHOT:
+        print("SNAPSHOT_DEBUG=on")
+    return 0
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        print("UNCAUGHT EXCEPTION:", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)
