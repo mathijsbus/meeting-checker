@@ -1,3 +1,16 @@
+# checker.py
+# Vereist env/secrets:
+# - LOGIN_URL, TARGET_URL
+# - SITE_USERNAME, SITE_PASSWORD
+# - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# Optioneel (Variables):
+# - EXPECTED_HOST, EXPECTED_PATH, CONFIRM_TEXT, CSS_SELECTOR
+# - DEBUG_SNAPSHOT ("1" om HTML/PNG artifacts te schrijven)
+# - LOGIN_USERNAME_SELECTOR, LOGIN_PASSWORD_SELECTOR, LOGIN_SUBMIT_SELECTOR
+# - USE_PLAYWRIGHT ("1" standaard), USER_AGENT
+# - TEXT_TO_FIND (default: "Geen dagen gevonden.")
+# - USERNAME_FIELD, PASSWORD_FIELD (alleen voor requests-fallback)
+
 import os, sys, time, json, re, traceback
 from html import unescape
 from urllib.parse import urlparse
@@ -10,7 +23,7 @@ TARGET_URL      = os.getenv("TARGET_URL")
 USERNAME        = os.getenv("SITE_USERNAME")
 PASSWORD        = os.getenv("SITE_PASSWORD")
 
-# requests-fallback (alleen als de site server-side form heeft)
+# requests-fallback (alleen als de site pure server-side login heeft)
 USERNAME_FIELD  = os.getenv("USERNAME_FIELD", "email")
 PASSWORD_FIELD  = os.getenv("PASSWORD_FIELD", "password")
 
@@ -95,7 +108,7 @@ def save_snapshot_files(html: str, png_exists: bool):
     except Exception as e:
         print(f"Snapshot failed: {e}", file=sys.stderr)
 
-# ====== requests fallback (werkt alleen als de site server-side rendered login heeft) ======
+# ====== requests fallback ======
 def fetch_via_requests():
     def safe_get(sess, url):
         r = sess.get(url, timeout=25, allow_redirects=True); r.raise_for_status(); return r
@@ -129,7 +142,8 @@ def fetch_via_playwright():
             el = loc.nth(i)
             try:
                 if el.is_visible(): return el
-            except Exception: pass
+            except Exception:
+                pass
         return None
 
     def fill_visible(page, selectors, value, label):
@@ -143,15 +157,13 @@ def fetch_via_playwright():
                 try: el.type(value, delay=10, timeout=4000)
                 except Exception: el.fill(value, timeout=4000)
                 print(f"Filled {label}: {sel}")
-                return el
-        return None
+                return el, sel
+        return None, None
 
     def submit_enabled(page):
         try:
-            btn = first_visible(page, 'button[type="submit"], input[type="submit"]')
-            if not btn: return False
-            try: return btn.is_enabled()
-            except Exception: return True
+            btn = page.locator('button[type="submit"], input[type="submit"]').first
+            return btn.is_visible() and btn.is_enabled()
         except Exception:
             return False
 
@@ -170,7 +182,7 @@ def fetch_via_playwright():
             print("Login required → opening LOGIN_URL …")
             page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
 
-            # Kandidaten (eerst jouw overrides)
+            # Kandidaten (eerst eventuele overrides)
             user_cands = [LOGIN_USERNAME_SELECTOR] if LOGIN_USERNAME_SELECTOR else []
             user_cands += [
                 ':has(label:has-text("Emailadres")) input',
@@ -189,54 +201,79 @@ def fetch_via_playwright():
                 'button:has-text("Inloggen")','text=Inloggen'
             ]
 
-            uel = fill_visible(page, user_cands, USERNAME, "email/username")
-            pel = fill_visible(page, pass_cands, PASSWORD, "password")
-
+            pel, _ = None, None
+            uel, _ = fill_visible(page, user_cands, USERNAME, "email/username")
+            if uel:
+                pel, _ = fill_visible(page, pass_cands, PASSWORD, "password")
             if not uel or not pel:
                 raise RuntimeError("Kon zichtbare velden niet vinden.")
 
-            # Trigger validatie (blur/tab/enter)
+            # Forceer input/change/blur events voor validatie
             try:
-                pel.blur()
-                page.keyboard.press("Tab")
-                time.sleep(0.2)
-            except Exception: pass
+                page.evaluate("""
+                    (emailSel, passSel) => {
+                      const sel = (q) => document.querySelector(q);
+                      const e = sel(emailSel) || sel('input[name="email"]');
+                      const p = sel(passSel)  || sel('input[name="password"]');
+                      for (const el of [e,p]) {
+                        if (!el) continue;
+                        el.dispatchEvent(new Event('input', {bubbles:true}));
+                        el.dispatchEvent(new Event('change',{bubbles:true}));
+                        el.blur();
+                      }
+                    }
+                """, LOGIN_USERNAME_SELECTOR or 'input[name="email"]',
+                     LOGIN_PASSWORD_SELECTOR or 'input[name="password"]')
+                time.sleep(0.3)
+            except Exception:
+                pass
 
-            # alleen klikken als enabled
+            # Probeer click als enabled → anders Enter → anders requestSubmit()
             clicked = False
-            for sel in submit_cands:
-                btn = first_visible(page, sel)
-                if btn:
-                    if submit_enabled(page):
-                        try:
-                            btn.click(timeout=3000)
-                            print(f"Clicked submit: {sel}")
-                            clicked = True
-                            break
-                        except Exception as e:
-                            print(f"Click failed on {sel}: {e}")
-                    else:
-                        print(f"Submit found but DISABLED: {sel}")
+            if submit_enabled(page):
+                try:
+                    page.locator('button[type="submit"], input[type="submit"]').first.click(timeout=3000)
+                    print("Clicked enabled submit")
+                    clicked = True
+                except Exception as e:
+                    print(f"Click enabled submit failed: {e}")
+
             if not clicked:
-                # probeer Enter
                 try:
                     page.keyboard.press("Enter")
                     print("Pressed Enter to submit.")
-                except Exception: pass
+                    time.sleep(0.4)
+                    clicked = True
+                except Exception:
+                    pass
+
+            if not submit_enabled(page):
+                try:
+                    page.evaluate("""
+                        () => {
+                          const btn = document.querySelector('button[type="submit"], input[type="submit"]');
+                          const form = (btn && btn.closest('form')) || document.querySelector('form');
+                          if (form && form.requestSubmit) form.requestSubmit();
+                          else if (form) form.submit();
+                        }
+                    """)
+                    print("Forced form submit via requestSubmit()")
+                except Exception as e:
+                    print("requestSubmit() failed:", e)
 
             try:
                 page.wait_for_load_state("networkidle", timeout=15000)
             except PWTimeout:
                 pass
 
-            # Screenshot na submit
             if DEBUG_SNAPSHOT:
                 try:
                     page.screenshot(path="after_submit.png", full_page=True)
                     print("Screenshot saved: after_submit.png")
-                except Exception: pass
+                except Exception:
+                    pass
 
-            # Altijd terug naar TARGET (exact 1x), geen loop
+            # 1x terug naar TARGET (geen loop)
             page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
 
         # 3) Content ophalen
@@ -295,7 +332,7 @@ def main():
     save_snapshot_files(html, png_written)
     full_text = unescape(html)
 
-    # als we nog op login staan → stoppen (geen loop) met duidelijke melding
+    # Nog op login? (geen loop)
     if looks_like_login_page(full_text):
         print("Op loginpagina gebleven; login is niet gelukt (submit disabled of geweigerd).")
         print(f"Final URL: {final_url}")
